@@ -21,7 +21,7 @@ import platform    # Para obtener info NO sensible del entorno (SO, version de P
 
 import requests               # Cliente HTTP para hablar con la API de Moltbook
 from dotenv import load_dotenv  # Carga variables desde el archivo .env al entorno
-from openai import OpenAI       # Cliente oficial de OpenAI (compatible con el patron chat.completions)
+import anthropic                # Cliente oficial de Anthropic (API de Claude)
 
 
 # ======================================================================
@@ -33,13 +33,13 @@ load_dotenv()
 
 # os.getenv() lee la variable; si no existe, devuelve None en vez de fallar.
 MOLTBOOK_API_KEY = os.getenv("MOLTBOOK_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Verificacion temprana: si falta alguna clave, el bot no debe arrancar.
 # Esto evita errores confusos mas adelante en el ciclo.
-if not MOLTBOOK_API_KEY or not OPENAI_API_KEY:
+if not MOLTBOOK_API_KEY or not ANTHROPIC_API_KEY:
     print("[ERROR] Faltan credenciales. Revisa que tu archivo .env exista y "
-          "tenga MOLTBOOK_API_KEY y OPENAI_API_KEY definidos (ver .env.example).")
+          "tenga MOLTBOOK_API_KEY y ANTHROPIC_API_KEY definidos (ver .env.example).")
     sys.exit(1)  # Codigo de salida distinto de 0 = "termino con error"
 
 
@@ -69,13 +69,19 @@ TIEMPO_ESPERA_SEGUNDOS = 1860  # 31 minutos exactos
 # "cuanto tiempo llevo vivo" de forma narrativa (dato NO sensible).
 TIEMPO_INICIO_PROCESO = time.time()
 
-# Cliente de OpenAI. La clave se pasa explicitamente desde la variable de
+# Cliente de Anthropic. La clave se pasa explicitamente desde la variable de
 # entorno cargada arriba; nunca se escribe la clave en texto plano aqui.
-cliente_openai = OpenAI(api_key=OPENAI_API_KEY)
+cliente_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Modelo de lenguaje a utilizar para la fase de "Pensar".
-# Puedes cambiarlo por el modelo que prefieras usar en tu cuenta de OpenAI.
-MODELO_LLM = "gpt-4o-mini"
+# claude-sonnet-5: buen equilibrio calidad/costo para publicaciones cortas
+# y de alto volumen (bajo latency-sensitive, no requiere razonamiento profundo).
+MODELO_LLM = "claude-sonnet-5"
+
+# Nivel de esfuerzo de razonamiento del modelo. Para publicaciones breves y
+# casuales como estas, "low" mantiene el costo y la latencia bajos sin
+# sacrificar calidad perceptible en el resultado.
+NIVEL_ESFUERZO = "low"
 
 
 # ======================================================================
@@ -238,24 +244,41 @@ def pensar_respuesta(contexto_comunidad):
     )
 
     try:
-        respuesta = cliente_openai.chat.completions.create(
+        # En la API de Anthropic el "system prompt" va en su propio parametro
+        # (no como un mensaje mas dentro de la lista "messages").
+        # No se envia "temperature": Claude Sonnet 5 corre con razonamiento
+        # adaptativo por defecto, y ese modo rechaza el muestreo (temperature/
+        # top_p/top_k) con un error 400. La variedad se logra de forma natural
+        # con el prompt, sin necesidad de ese parametro.
+        respuesta = cliente_anthropic.messages.create(
             model=MODELO_LLM,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": mensaje_usuario},
-            ],
             max_tokens=500,
-            temperature=0.9,  # un poco de variedad creativa entre publicaciones
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": mensaje_usuario}],
+            output_config={"effort": NIVEL_ESFUERZO},
         )
-        texto_generado = respuesta.choices[0].message.content
-        return texto_generado.strip() if texto_generado else None
 
+        # respuesta.content es una lista de bloques (texto, pensamiento, etc.).
+        # Buscamos el primer bloque de tipo "text" para extraer la publicacion.
+        bloque_texto = next(
+            (bloque.text for bloque in respuesta.content if bloque.type == "text"),
+            None,
+        )
+        return bloque_texto.strip() if bloque_texto else None
+
+    except anthropic.RateLimitError:
+        print("[PENSAR] Limite de tasa alcanzado en la API de Anthropic.")
+    except anthropic.APIStatusError:
+        print("[PENSAR] Error de la API de Anthropic al generar contenido.")
+    except anthropic.APIConnectionError:
+        print("[PENSAR] Error de conexion al contactar la API de Anthropic.")
     except Exception:
-        # Captura generica: nunca imprimimos el objeto de excepcion completo
-        # porque podria incluir fragmentos de la peticion (potencialmente
-        # con datos sensibles). Solo un mensaje humano y generico.
-        print("[PENSAR] Error al generar contenido con el modelo de lenguaje.")
-        return None
+        # Captura generica de respaldo: nunca imprimimos el objeto de
+        # excepcion completo porque podria incluir fragmentos de la peticion
+        # (potencialmente con datos sensibles). Solo un mensaje generico.
+        print("[PENSAR] Error inesperado al generar contenido con el modelo de lenguaje.")
+
+    return None
 
 
 # ======================================================================
