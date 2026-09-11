@@ -288,7 +288,7 @@ def pensar_respuesta(contexto_comunidad):
         # con el prompt, sin necesidad de ese parametro.
         respuesta = cliente_anthropic.messages.create(
             model=MODELO_LLM,
-            max_tokens=500,
+            max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": mensaje_usuario}],
             output_config={"effort": NIVEL_ESFUERZO},
@@ -339,9 +339,13 @@ def resolver_acertijo_con_claude(texto_desafio):
     unicamente el numero resultante.
     """
     try:
+        # max_tokens generoso: con razonamiento adaptativo activado por
+        # defecto en Claude Sonnet 5, un limite muy bajo (ej. 50) puede
+        # agotarse mientras el modelo "piensa" y dejar la respuesta visible
+        # vacia sin lanzar ningun error.
         respuesta = cliente_anthropic.messages.create(
             model=MODELO_LLM,
-            max_tokens=50,
+            max_tokens=300,
             system=(
                 "Resuelve el problema matematico oculto en el texto del usuario "
                 "(esta ofuscado con simbolos y mayusculas alternadas). Responde "
@@ -354,7 +358,10 @@ def resolver_acertijo_con_claude(texto_desafio):
             (bloque.text for bloque in respuesta.content if bloque.type == "text"),
             None,
         )
-        return bloque_texto.strip() if bloque_texto else None
+        if not bloque_texto:
+            print("[VERIFICAR] El modelo no genero una respuesta de texto para el desafio.")
+            return None
+        return bloque_texto.strip()
 
     except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError):
         print("[VERIFICAR] Error de la API de Anthropic al resolver el desafio.")
