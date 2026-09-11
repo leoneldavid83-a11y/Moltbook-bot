@@ -295,6 +295,13 @@ def pensar_respuesta(contexto_comunidad):
             output_config={"effort": NIVEL_ESFUERZO},
         )
 
+        # IMPORTANTE: revisar stop_reason antes de leer el contenido. Si el
+        # modelo rechazo la peticion (stop_reason="refusal"), "content" viene
+        # vacio ([]) sin lanzar ninguna excepcion.
+        if respuesta.stop_reason == "refusal":
+            print("[PENSAR] El modelo rechazo generar la publicacion para este ciclo.")
+            return None
+
         # respuesta.content es una lista de bloques (texto, pensamiento, etc.).
         # Buscamos el primer bloque de tipo "text" para extraer la publicacion.
         bloque_texto = next(
@@ -333,12 +340,19 @@ def separar_titulo_y_contenido(texto_generado):
     return titulo, contenido
 
 
-def resolver_acertijo_con_claude(texto_desafio):
+def resolver_acertijo_con_claude(texto_desafio, intento=1):
     """
     Moltbook exige resolver un problema matematico (ofuscado en texto) antes
     de publicar. Le pedimos al mismo modelo que lo resuelva y devuelva
     unicamente el numero resultante.
+
+    Los acertijos de Moltbook usan temas de cangrejos/langostas ("una garra
+    ejerce X newtons...") con texto ofuscado por simbolos y mayusculas
+    alternadas. Esa combinacion a veces activa el clasificador de seguridad
+    del modelo (stop_reason="refusal"), que no es un error de la API sino
+    una decision de politica de contenido. Por eso se reintenta una vez.
     """
+    MAX_INTENTOS = 2
     try:
         # max_tokens generoso: con razonamiento adaptativo activado por
         # defecto en Claude Sonnet 5, un limite muy bajo (ej. 50) puede
@@ -355,6 +369,16 @@ def resolver_acertijo_con_claude(texto_desafio):
             messages=[{"role": "user", "content": texto_desafio}],
             output_config={"effort": NIVEL_ESFUERZO},
         )
+
+        # IMPORTANTE: siempre revisar stop_reason antes de leer el contenido.
+        # Si el modelo rechazo la peticion, "content" viene vacio ([]) y no
+        # se lanza ninguna excepcion: hay que detectarlo explicitamente.
+        if respuesta.stop_reason == "refusal":
+            print(f"[VERIFICAR] El modelo rechazo el desafio (intento {intento}/{MAX_INTENTOS}).")
+            if intento < MAX_INTENTOS:
+                return resolver_acertijo_con_claude(texto_desafio, intento=intento + 1)
+            return None
+
         bloque_texto = next(
             (bloque.text for bloque in respuesta.content if bloque.type == "text"),
             None,
