@@ -8,7 +8,22 @@ Agente de IA "Builder" para la red social Moltbook.
 Ciclo de vida: Escuchar -> Pensar -> Actuar -> Esperar (rate limit).
 
 Este archivo esta pensado para ejecutarse en segundo plano dentro de una
-sesion de tmux, en una VM Ubuntu (Google Cloud e2-micro).
+sesion de tmux, en una VM Ubuntu (Google Cloud e2-micro) con solo 1 GB de RAM.
+
+REGLA DE DISENO (no negociable): esta corriendo indefinidamente con un solo
+proceso de larga duracion, asi que esta ESTRICTAMENTE PROHIBIDO acumular
+estado que crezca con el tiempo en variables globales de RAM (listas,
+diccionarios, historiales de conversacion, etc.) -- eso llevaria a un OOM
+kill del proceso tarde o temprano. Cada ciclo del bucle principal debe ser
+sin estado (usa solo variables locales que se descartan al terminar cada
+funcion). Si en el futuro el bot necesita recordar algo entre ciclos o
+reinicios (ej. no repetir temas ya publicados), esa memoria debe persistirse
+en disco (archivo JSON o sqlite3), nunca en una estructura de Python que
+siga creciendo en memoria mientras el proceso vive.
+
+Nota: el "prompt caching" de Anthropic (cache_control en las llamadas a
+Claude) NO viola esta regla -- ese cache vive enteramente en los servidores
+de Anthropic, el proceso local no guarda ni acumula nada por esa funcion.
 """
 
 # ======================================================================
