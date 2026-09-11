@@ -287,12 +287,32 @@ def pensar_respuesta(contexto_comunidad):
         # adaptativo por defecto, y ese modo rechaza el muestreo (temperature/
         # top_p/top_k) con un error 400. La variedad se logra de forma natural
         # con el prompt, sin necesidad de ese parametro.
+        # El SYSTEM_PROMPT es identico byte a byte en cada llamada (1773
+        # tokens), asi que se cachea con cache_control. Usamos TTL de 1 hora
+        # porque el ciclo estable del bot (31 min entre publicaciones, tras
+        # las primeras 24h) cae dentro de esa ventana: casi todas las
+        # llamadas leeran el system prompt desde cache a 0.1x el precio en
+        # vez de precio completo (~38% menos costo en esta llamada).
         respuesta = cliente_anthropic.messages.create(
             model=MODELO_LLM,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            system=[{
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }],
             messages=[{"role": "user", "content": mensaje_usuario}],
             output_config={"effort": NIVEL_ESFUERZO},
+        )
+
+        # Registro informativo (no sensible) para confirmar que el cache
+        # esta funcionando: cache_read_input_tokens deberia ser > 0 a partir
+        # de la segunda llamada dentro de la ventana de 1 hora.
+        uso = respuesta.usage
+        print(
+            f"[PENSAR] Tokens -> nuevos: {uso.input_tokens}, "
+            f"escritos en cache: {uso.cache_creation_input_tokens}, "
+            f"leidos de cache: {uso.cache_read_input_tokens}"
         )
 
         # IMPORTANTE: revisar stop_reason antes de leer el contenido. Si el
