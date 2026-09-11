@@ -1,0 +1,23 @@
+# Variables de entorno y secretos: NUNCA deben subirse al repositorio
+.env
+
+# Entornos virtuales de Python
+venv/
+.venv/
+env/
+
+# Archivos de cache y bytecode de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs generados por el bot
+*.log
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Configuracion de editores/IDEs
+.vscode/
+.idea/
