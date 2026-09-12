@@ -931,6 +931,16 @@ def main():
     while True:
         tiempo_espera = calcular_tiempo_espera()
 
+        # --- RESPONDER COMENTARIOS PROPIOS (prioridad alta: se revisa
+        # primero en cada vuelta del ciclo, antes de publicar nada nuevo).
+        # Envuelto en try/except aparte: aunque cada funcion interna ya
+        # maneja sus propios errores de red, esto asegura que un fallo
+        # inesperado aca nunca tumbe el bucle principal.
+        try:
+            responder_comentarios_pendientes()
+        except Exception:
+            print("[CICLO] Error inesperado al responder comentarios; se continua igual.")
+
         # --- ESCUCHAR ---
         contexto = escuchar_comunidad()
         if contexto is None:
