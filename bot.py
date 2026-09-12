@@ -33,6 +33,7 @@ import os          # Para leer variables de entorno del sistema operativo
 import sys         # Para poder salir del programa de forma controlada (sys.exit)
 import time        # Para medir tiempo de arranque y para el time.sleep() del rate limit
 import platform    # Para obtener info NO sensible del entorno (SO, version de Python)
+import sqlite3     # Base de datos en disco para recordar que comentarios ya se respondieron
 from datetime import datetime, timezone  # Para calcular la antiguedad del agente (rate limit dinamico)
 
 import requests               # Cliente HTTP para hablar con la API de Moltbook
@@ -76,9 +77,22 @@ URL_PUBLICAR_SUBMOLT = f"{MOLTBOOK_BASE_URL}/posts"
 # Endpoint para resolver el desafio de verificacion anti-spam de Moltbook.
 URL_VERIFICAR = f"{MOLTBOOK_BASE_URL}/verify"
 
+# Endpoint del "dashboard" del agente: karma, notificaciones sin leer, y que
+# posts propios tienen comentarios nuevos (activity_on_your_posts).
+URL_HOME = f"{MOLTBOOK_BASE_URL}/home"
+
 # Nombre del submolt donde este agente participa: "Agent Infrastructure",
 # la comunidad real de Moltbook mas afin a la identidad Builder del agente.
 NOMBRE_SUBMOLT = "infrastructure"
+
+# Nombre de usuario del propio agente en Moltbook (usado para nunca
+# contestarse a si mismo si un hilo llegara a incluir un comentario propio).
+NOMBRE_AGENTE = "davlerd"
+
+# Archivo sqlite3 donde se registra que comentarios ya fueron respondidos,
+# para no volver a contestarlos en ciclos futuros. Vive en disco, no en RAM
+# (ver regla de diseno al inicio del archivo).
+RUTA_BASE_DATOS = "estado_bot.sqlite3"
 
 # Fecha de registro del agente en Moltbook (devuelta por /agents/register).
 # Se usa para calcular el rate limit correcto: los agentes con menos de 24h
@@ -543,11 +557,149 @@ def actuar_publicar(texto_generado):
 
 
 # ======================================================================
-# 8. BUCLE PRINCIPAL: ESCUCHAR -> PENSAR -> ACTUAR -> ESPERAR
+# 8. RESPONDER COMENTARIOS EN POSTS PROPIOS (PRIMER PASO: SOLO DETECCION)
+# ======================================================================
+# Esta seccion todavia NO genera ni publica respuestas. Solo detecta, de
+# forma confiable, que comentarios nuevos hay en los posts propios y cuales
+# de esos ya fueron respondidos antes (usando la base de datos en disco).
+# El siguiente paso (generar la respuesta con Claude y publicarla) se agrega
+# despues de validar que esta deteccion funciona sobre datos reales.
+
+def inicializar_base_datos():
+    """
+    Crea (si no existe) la tabla que registra que comentarios ya fueron
+    respondidos. Se ejecuta una vez al arrancar el proceso. El archivo vive
+    en disco (RUTA_BASE_DATOS), nunca en una estructura de Python en RAM.
+    """
+    conexion = sqlite3.connect(RUTA_BASE_DATOS)
+    conexion.execute(
+        """
+        CREATE TABLE IF NOT EXISTS comentarios_respondidos (
+            comment_id TEXT PRIMARY KEY,
+            post_id TEXT NOT NULL,
+            respondido_en TEXT NOT NULL
+        )
+        """
+    )
+    conexion.commit()
+    conexion.close()
+
+
+def ya_fue_respondido(comment_id):
+    """
+    Consulta en disco si ya le contestamos a este comentario en un ciclo
+    anterior. Abrimos y cerramos la conexion en cada llamada a proposito:
+    es una operacion barata y evita mantener un objeto de conexion viviendo
+    indefinidamente en memoria junto con el proceso principal.
+    """
+    conexion = sqlite3.connect(RUTA_BASE_DATOS)
+    fila = conexion.execute(
+        "SELECT 1 FROM comentarios_respondidos WHERE comment_id = ?",
+        (comment_id,),
+    ).fetchone()
+    conexion.close()
+    return fila is not None
+
+
+def marcar_como_respondido(comment_id, post_id):
+    """Registra en disco que ya se respondio este comentario."""
+    conexion = sqlite3.connect(RUTA_BASE_DATOS)
+    conexion.execute(
+        "INSERT OR IGNORE INTO comentarios_respondidos (comment_id, post_id, respondido_en) "
+        "VALUES (?, ?, ?)",
+        (comment_id, post_id, datetime.now(timezone.utc).isoformat()),
+    )
+    conexion.commit()
+    conexion.close()
+
+
+def obtener_actividad_reciente():
+    """
+    Hace un GET a /home y devuelve la lista de posts propios que tienen
+    notificaciones nuevas (comentarios sin leer). Devuelve una lista de
+    diccionarios {"post_id": ..., "post_title": ..., "cantidad": ...}, o
+    una lista vacia si no hay actividad nueva o si algo fallo.
+    """
+    cabeceras = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
+
+    try:
+        respuesta = requests.get(URL_HOME, headers=cabeceras, timeout=15)
+        respuesta.raise_for_status()
+        datos = respuesta.json()
+
+        actividad = datos.get("activity_on_your_posts", [])
+        return [
+            {
+                "post_id": item.get("post_id"),
+                "post_title": item.get("post_title", "(sin titulo)"),
+                "cantidad": item.get("new_notification_count", 0),
+            }
+            for item in actividad
+            if item.get("post_id") and item.get("new_notification_count", 0) > 0
+        ]
+
+    except requests.exceptions.Timeout:
+        print("[NOTIFICACIONES] Error: tiempo de espera agotado al consultar /home.")
+    except requests.exceptions.HTTPError:
+        print("[NOTIFICACIONES] Error HTTP al consultar /home.")
+    except requests.exceptions.RequestException:
+        print("[NOTIFICACIONES] Error de conexion al consultar /home.")
+    except ValueError:
+        print("[NOTIFICACIONES] Error al interpretar la respuesta de /home.")
+
+    return []
+
+
+def obtener_comentarios_nuevos(post_id):
+    """
+    Lee los comentarios de un post propio (los mas nuevos primero) y
+    devuelve solo los que todavia no estan marcados como respondidos en la
+    base de datos local. Por ahora solo mira comentarios de primer nivel
+    (no respuestas anidadas dentro de otras respuestas).
+    """
+    cabeceras = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
+    parametros = {"sort": "new", "limit": 20}
+    url = f"{MOLTBOOK_BASE_URL}/posts/{post_id}/comments"
+
+    try:
+        respuesta = requests.get(url, headers=cabeceras, params=parametros, timeout=15)
+        respuesta.raise_for_status()
+        datos = respuesta.json()
+
+        comentarios = datos.get("comments", [])
+        nuevos = []
+        for comentario in comentarios:
+            comment_id = comentario.get("id")
+            autor = comentario.get("author", {}).get("name")
+            # Nunca contestarnos a nosotros mismos si el hilo llegara a
+            # incluir un comentario propio de un ciclo anterior.
+            if not comment_id or autor == NOMBRE_AGENTE:
+                continue
+            if not ya_fue_respondido(comment_id):
+                nuevos.append(comentario)
+
+        return nuevos
+
+    except requests.exceptions.Timeout:
+        print("[NOTIFICACIONES] Error: tiempo de espera agotado al leer comentarios.")
+    except requests.exceptions.HTTPError:
+        print("[NOTIFICACIONES] Error HTTP al leer comentarios del post.")
+    except requests.exceptions.RequestException:
+        print("[NOTIFICACIONES] Error de conexion al leer comentarios del post.")
+    except ValueError:
+        print("[NOTIFICACIONES] Error al interpretar los comentarios del post.")
+
+    return []
+
+
+# ======================================================================
+# 9. BUCLE PRINCIPAL: ESCUCHAR -> PENSAR -> ACTUAR -> ESPERAR
 # ======================================================================
 def main():
     print("=== Agente Builder para Moltbook iniciado ===")
     print("Ciclo: Escuchar -> Pensar -> Actuar -> Esperar (rate limit dinamico)")
+
+    inicializar_base_datos()
 
     while True:
         tiempo_espera = calcular_tiempo_espera()
