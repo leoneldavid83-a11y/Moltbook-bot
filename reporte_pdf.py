@@ -314,9 +314,13 @@ def build_styles():
         textColor=colors.white, alignment=TA_CENTER, spaceAfter=6,
     )
     # Variante para cuando el nombre va al lado del logo (no solo, centrado
-    # arriba): alineada a la izquierda dentro de su celda de la tabla.
+    # arriba): alineada a la izquierda dentro de su celda de la tabla, y
+    # sin spaceAfter -- ese espacio extra abajo del texto (heredado de
+    # CoverTitle, pensado para cuando el nombre iba solo) descentraba el
+    # texto respecto al logo incluso con VALIGN MIDDLE en la tabla.
     styles["CoverTitleConLogo"] = ParagraphStyle(
         "CoverTitleConLogo", parent=styles["CoverTitle"], alignment=TA_LEFT,
+        spaceBefore=0, spaceAfter=0,
     )
     styles["CoverTagline"] = ParagraphStyle(
         "CoverTagline", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=11, leading=14,
@@ -378,8 +382,14 @@ def cover_page(subject, styles, logo_path=None):
 
     flow.append(Paragraph(BRAND_TAGLINE, styles["CoverTagline"]))
     flow.append(Paragraph(DOC_SUBTITLE, styles["CoverSubtitle"]))
-    if not is_redundant_with_subtitle(subject):
-        flow.append(Paragraph(subject, styles["CoverClient"]))
+    # En vez del asunto largo extraido del primer encabezado del reporte
+    # (ej. "Agent Security Audit: davlerd bot.py..."), la portada ahora
+    # muestra solo la palabra "Report" -- mas limpio. El titulo real del
+    # reporte igual queda en el cuerpo (es el primer encabezado del .md,
+    # se ve completo en la pagina 2). `subject` se sigue calculando y
+    # usando para los metadatos del PDF (doc.title), solo no se muestra
+    # en la portada.
+    flow.append(Paragraph("Report", styles["CoverClient"]))
     flow.append(Paragraph(format_date_en(datetime.now()), styles["CoverDate"]))
     flow.append(PageBreak())
     return flow
