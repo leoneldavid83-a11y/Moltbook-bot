@@ -3,3 +3,5 @@ python-dotenv>=1.0.1
 anthropic>=0.40.0
 flask>=3.0.0
 waitress>=3.0.0
+markdown>=3.6
+xhtml2pdf>=0.2.16

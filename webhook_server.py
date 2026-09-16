@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 from auditoria import elegir_skill_para_tarea, realizar_auditoria
+from reporte_pdf import generar_pdf_desde_markdown
 
 load_dotenv()
 
@@ -55,6 +56,11 @@ app = Flask(__name__)
 # resultado. Con max_tokens=16000 en auditoria.py, un reporte muy largo
 # podria superarlo -- se corta con margen antes de entregar.
 MAX_CARACTERES_ENTREGA = 49000
+
+# Endpoint REST de entrega final (soporta adjuntar archivos, a diferencia
+# del callback simple que solo manda texto). Requiere el API key, no la
+# firma HMAC -- es una llamada nuestra hacia su API, no un webhook de ellos.
+URL_ENTREGA_REST = "https://moltify.ai/api/agent/tasks/{task_id}/deliver"
 
 
 
@@ -170,7 +176,50 @@ def _procesar_tarea(tarea):
     if len(reporte) > MAX_CARACTERES_ENTREGA:
         reporte = reporte[:MAX_CARACTERES_ENTREGA]
 
+    _entregar_resultado_final(task_id, callback_url, titulo, reporte)
+
+
+def _entregar_resultado_final(task_id, callback_url, titulo_tarea, reporte):
+    """
+    Entrega el reporte final con un PDF con formato profesional adjunto
+    (via el endpoint REST que soporta archivos), ademas del texto plano.
+    Si algo falla generando o mandando el PDF, cae al callback simple de
+    solo texto -- el cliente siempre recibe algo, aunque no sea lo ideal.
+    """
+    fecha = time.strftime("%Y-%m-%d")
+    pdf_bytes = generar_pdf_desde_markdown(reporte, titulo_tarea or "Security Audit Report", fecha)
+
+    if pdf_bytes and MOLTIFY_API_KEY:
+        if _entregar_via_rest_con_pdf(task_id, reporte, pdf_bytes):
+            return
+        print("[WEBHOOK] La entrega con PDF fallo; caigo al callback de solo texto.")
+
     _enviar_callback(callback_url, "deliver", reporte)
+
+
+def _entregar_via_rest_con_pdf(task_id, contenido_texto, pdf_bytes):
+    """
+    Entrega el resultado via el endpoint REST (multipart/form-data), con
+    el reporte en texto Y el PDF adjunto. Devuelve True si salio bien.
+    """
+    url = URL_ENTREGA_REST.format(task_id=task_id)
+    cabeceras = {"Authorization": f"Bearer {MOLTIFY_API_KEY}"}
+    datos = {"content": contenido_texto}
+    archivos = {"files": ("security-audit-report.pdf", pdf_bytes, "application/pdf")}
+
+    try:
+        respuesta = requests.post(url, headers=cabeceras, data=datos, files=archivos, timeout=30)
+        respuesta.raise_for_status()
+        print("[WEBHOOK] Reporte final entregado con PDF adjunto.")
+        return True
+    except requests.exceptions.Timeout:
+        print("[WEBHOOK] Error: tiempo de espera agotado al entregar con PDF.")
+    except requests.exceptions.HTTPError:
+        print("[WEBHOOK] Error HTTP al entregar con PDF.")
+    except requests.exceptions.RequestException:
+        print("[WEBHOOK] Error de conexion al entregar con PDF.")
+
+    return False
 
 
 def _enviar_callback(callback_url, accion, contenido):
