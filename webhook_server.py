@@ -34,7 +34,7 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
-from auditoria import realizar_auditoria
+from auditoria import elegir_skill_para_tarea, realizar_auditoria
 
 load_dotenv()
 
@@ -56,9 +56,6 @@ app = Flask(__name__)
 # podria superarlo -- se corta con margen antes de entregar.
 MAX_CARACTERES_ENTREGA = 49000
 
-# Skill por defecto cuando la tarea no especifica cual usar. La auditoria
-# de agentes es la especialidad principal ya establecida del personaje.
-SKILL_POR_DEFECTO = "agent-security-audit"
 
 
 def _verificar_firma(cuerpo_crudo, timestamp, firma_recibida):
@@ -150,11 +147,18 @@ def _procesar_tarea(tarea):
         "Starting the security audit now -- a real OWASP-based review takes a few minutes, not seconds.",
     )
 
+    titulo = tarea.get("title", "")
     descripcion = tarea.get("description", "")
     requerimientos = tarea.get("requirements", "")
 
+    # Que skill usar no viene explicito en la tarea -- se infiere del
+    # titulo/descripcion/requisitos con una clasificacion barata (esfuerzo
+    # bajo) antes de correr la auditoria de verdad.
+    tipo_skill = elegir_skill_para_tarea(titulo, descripcion, requerimientos)
+    print(f"[WEBHOOK] Tarea {task_id} clasificada como: {tipo_skill}")
+
     reporte = realizar_auditoria(
-        SKILL_POR_DEFECTO,
+        tipo_skill,
         contenido_objetivo=requerimientos or descripcion,
         contexto_adicional=descripcion,
     )
