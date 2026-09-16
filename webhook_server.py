@@ -176,18 +176,22 @@ def _procesar_tarea(tarea):
     if len(reporte) > MAX_CARACTERES_ENTREGA:
         reporte = reporte[:MAX_CARACTERES_ENTREGA]
 
-    _entregar_resultado_final(task_id, callback_url, titulo, reporte)
+    _entregar_resultado_final(task_id, callback_url, reporte)
 
 
-def _entregar_resultado_final(task_id, callback_url, titulo_tarea, reporte):
+def _entregar_resultado_final(task_id, callback_url, reporte):
     """
     Entrega el reporte final con un PDF con formato profesional adjunto
     (via el endpoint REST que soporta archivos), ademas del texto plano.
     Si algo falla generando o mandando el PDF, cae al callback simple de
     solo texto -- el cliente siempre recibe algo, aunque no sea lo ideal.
+
+    No se fuerza el titulo de la tarea de Moltify como asunto de portada:
+    reporte_pdf.py lo extrae solo del primer encabezado del propio
+    reporte, que suele ser mas descriptivo (ej. "Agent Security Audit:
+    ...") que el titulo corto que puso el comprador al pedir la tarea.
     """
-    fecha = time.strftime("%Y-%m-%d")
-    pdf_bytes = generar_pdf_desde_markdown(reporte, titulo_tarea or "Security Audit Report", fecha)
+    pdf_bytes = generar_pdf_desde_markdown(reporte)
 
     if pdf_bytes and MOLTIFY_API_KEY:
         if _entregar_via_rest_con_pdf(task_id, reporte, pdf_bytes):

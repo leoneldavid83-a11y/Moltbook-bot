@@ -3,249 +3,481 @@
 """
 reporte_pdf.py
 ---------------
-Convierte el reporte markdown que genera auditoria.py en un PDF con
-formato profesional, para entregar como adjunto real (no solo texto
-plano) en las tareas de Moltify.
+Genera el PDF de marca "Davlerd" a partir del reporte markdown que produce
+auditoria.py. Basado en la skill "davlerd-cybersecurity-report" (generate_
+report.py) que armo el usuario -- usa reportlab directamente en vez de
+markdown+xhtml2pdf: reportlab ajusta el texto dentro de celdas de tabla de
+forma nativa (Paragraph flowables), sin los problemas de CSS no soportado
+ni desborde de columnas que se pelearon con xhtml2pdf antes.
 
-Deliberadamente pura-Python (markdown + xhtml2pdf, que usa reportlab por
-debajo): nada de binarios externos ni dependencias de sistema pesadas
-(WeasyPrint necesita Cairo/Pango, wkhtmltopdf es un binario aparte) -- en
-una VM de 1GB conviene lo mas liviano posible.
+Cambios de integracion sobre el script original de la skill:
+- Se registra la fuente DejaVu Sans (ya en fonts/ del repo) para que
+  simbolos Unicode como >= o -> se dibujen bien -- los estilos base de
+  reportlab (Helvetica) no cubren esos caracteres, mismo problema que
+  tuvimos con xhtml2pdf antes.
+- build_pdf_bytes() envuelve build_pdf() para devolver bytes en memoria
+  (BytesIO) en vez de escribir a un archivo, para integrarse con
+  webhook_server.py sin tocar disco.
+- El resto (parser de markdown, estilos, portada, resaltado de riesgo,
+  extraccion automatica del "asunto" desde el primer encabezado del .md)
+  es el diseño original de la skill, sin cambios de logica.
 
-REGLA DE DISENO (la misma que en el resto del proyecto): esto no acumula
+REGLA DE DISENO (la misma que en el resto del proyecto): no acumula
 estado en RAM. Cada PDF se genera, se devuelve como bytes, y se olvida.
 """
 
+import difflib
 import io
+import os
 import re
+import unicodedata
+from datetime import datetime
+from pathlib import Path
 
-import markdown as md_lib
-from bs4 import BeautifulSoup
-from xhtml2pdf import pisa
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    HRFlowable, Image, ListFlowable, ListItem, PageBreak, Paragraph,
+    SimpleDocTemplate, Spacer, Table, TableStyle,
+)
 
-# Anchos de columna (en %) para encabezados de tabla reconocidos. Los que
-# suelen llevar texto/codigo largo (rutas, identificadores) necesitan mas
-# espacio; los categoricos cortos (Risk Level: High/Medium/Low) necesitan
-# poco. Cualquier columna no listada se reparte el espacio restante en
-# partes iguales.
-ANCHOS_COLUMNA_POR_ENCABEZADO = {
-    "input path": 28,
-    "risk level": 12,
-    "location": 22,
-    "confidence": 12,
-    "severity": 12,
-    "access level": 20,
+# ---------------------------------------------------------------------------
+# Fuente Unicode: se registra una sola vez al importar el modulo. Sin esto,
+# reportlab usa Helvetica por defecto, que no tiene glifos para simbolos
+# como >= o -> que Claude a veces usa en los reportes (salen como cuadros
+# en blanco, el mismo problema que se encontro con xhtml2pdf).
+# ---------------------------------------------------------------------------
+RUTA_FUENTES = Path(__file__).parent / "fonts"
+NOMBRE_FUENTE = "Helvetica"
+NOMBRE_FUENTE_BOLD = "Helvetica-Bold"
+
+_ruta_regular = RUTA_FUENTES / "DejaVuSans.ttf"
+_ruta_bold = RUTA_FUENTES / "DejaVuSans-Bold.ttf"
+if _ruta_regular.is_file() and _ruta_bold.is_file():
+    try:
+        pdfmetrics.registerFont(TTFont("DejaVuSans", str(_ruta_regular)))
+        pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", str(_ruta_bold)))
+        NOMBRE_FUENTE = "DejaVuSans"
+        NOMBRE_FUENTE_BOLD = "DejaVuSans-Bold"
+    except Exception:
+        print("[PDF] No se pudo registrar DejaVu Sans; se usa Helvetica (menor cobertura Unicode).")
+
+
+def format_date_en(dt: datetime) -> str:
+    meses = {
+        1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+        7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December",
+    }
+    return f"Generated on {meses[dt.month]} {dt.day}, {dt.year}"
+
+
+# ---------------------------------------------------------------------------
+# Marca / estilo
+# ---------------------------------------------------------------------------
+BRAND_NAME = "DAVLERD"
+BRAND_TAGLINE = "Cybersecurity Bot"
+DOC_SUBTITLE = "Cybersecurity Audit Report"
+
+PRIMARY_DARK = colors.HexColor("#0B1B33")
+ACCENT = colors.HexColor("#00C2A8")
+TEXT_GRAY = colors.HexColor("#3A3A3A")
+
+RISK_COLORS = {
+    "critical": colors.HexColor("#7A0C0C"),
+    "high": colors.HexColor("#C0392B"),
+    "medium": colors.HexColor("#E08E0B"),
+    "moderate": colors.HexColor("#E08E0B"),
+    "low": colors.HexColor("#2E8B57"),
+    "informational": colors.HexColor("#5B7DB1"),
+    "critico": colors.HexColor("#7A0C0C"),
+    "crítico": colors.HexColor("#7A0C0C"),
+    "alto": colors.HexColor("#C0392B"),
+    "medio": colors.HexColor("#E08E0B"),
+    "moderado": colors.HexColor("#E08E0B"),
+    "bajo": colors.HexColor("#2E8B57"),
+    "informativo": colors.HexColor("#5B7DB1"),
 }
 
-# Colores por severidad, para que los hallazgos se distingan de un
-# vistazo (igual que en cualquier reporte de seguridad real).
-COLORES_SEVERIDAD = {
-    "CRITICAL": "#b30000",
-    "HIGH": "#e05d00",
-    "MEDIUM": "#b8860b",
-    "LOW": "#2f6db3",
-    "INFORMATIONAL": "#555555",
-}
+DEFAULT_SUBJECT = "Findings Report"
+DEFAULT_LOGO = Path(__file__).parent / "assets" / "davlerd-logo.png"
 
-PLANTILLA_HTML = """
-<html>
-<head>
-<style>
-    /* DejaVu Sans en vez de Helvetica: tiene cobertura Unicode amplia
-       (flechas, simbolos matematicos, etc.) que Claude a veces usa en los
-       reportes y que Helvetica no puede dibujar (salen como cuadros en
-       blanco). Ya viene instalada en la VM (paquete fonts-dejavu-core). */
-    @font-face {{
-        font-family: "DejaVu Sans";
-        src: url("fonts/DejaVuSans.ttf");
-    }}
-    @font-face {{
-        font-family: "DejaVu Sans";
-        font-weight: bold;
-        src: url("fonts/DejaVuSans-Bold.ttf");
-    }}
-    @page {{
-        size: A4;
-        margin: 2.2cm 1.8cm;
-        @frame footer_frame {{
-            -pdf-frame-content: footer_content;
-            bottom: 1cm; margin-left: 1.8cm; margin-right: 1.8cm; height: 1cm;
-        }}
-    }}
-    body {{
-        font-family: "DejaVu Sans", Helvetica, Arial, sans-serif;
-        font-size: 10pt;
-        line-height: 1.5;
-        color: #1a1a1a;
-    }}
-    .portada {{
-        text-align: center;
-        padding-top: 6cm;
-    }}
-    .portada h1 {{
-        font-size: 22pt;
-        margin-bottom: 0.3cm;
-    }}
-    .portada .subtitulo {{
-        font-size: 12pt;
-        color: #555555;
-    }}
-    .portada .marca {{
-        margin-top: 3cm;
-        font-size: 10pt;
-        color: #888888;
-    }}
-    h1 {{ font-size: 16pt; color: #111111; border-bottom: 2px solid #333333; padding-bottom: 4px; }}
-    h2 {{ font-size: 13pt; color: #222222; margin-top: 18px; }}
-    h3 {{ font-size: 11.5pt; margin-top: 14px; }}
-    /* NOTA: xhtml2pdf ignora table-layout/word-wrap/overflow-wrap sin
-       avisar con error, solo con un warning en consola -- no sirven aca,
-       asi que no se usan. El corte de linea en identificadores largos
-       (nombres de funciones con guion bajo) se resuelve insertando
-       espacios de ancho cero en el HTML, ver _insertar_puntos_de_corte_en_codigo. */
-    table {{ width: 100%; margin: 8px 0; }}
-    th, td {{ border: 1px solid #cccccc; padding: 5px 8px; font-size: 8.5pt; text-align: left; }}
-    th {{ background-color: #f0f0f0; }}
-    /* Dentro de celdas de tabla, <code> con fondo propio se ve peor que
-       texto monoespaciado simple cuando hace salto de linea en una
-       columna angosta. Fuera de tablas si mantiene el fondo (ahi funciona
-       bien, ver la regla "code" mas abajo). */
-    td code, th code {{
-        font-family: Courier, monospace; font-size: 8pt; background-color: transparent; padding: 0;
-    }}
-    code {{ background-color: #f2f2f2; padding: 1px 3px; font-family: Courier, monospace; font-size: 8.5pt; }}
-    pre {{ background-color: #f2f2f2; padding: 8px; font-family: Courier, monospace; font-size: 8.5pt; }}
-    hr {{ border: none; border-top: 1px solid #dddddd; margin: 14px 0; }}
-    #footer_content {{ font-size: 8pt; color: #999999; text-align: center; }}
-</style>
-</head>
-<body>
-    <div class="portada">
-        <h1>{titulo}</h1>
-        <div class="subtitulo">Security Assessment Report</div>
-        <div class="marca">Prepared by davlerd -- OWASP Secure Agent Playbook methodology<br/>{fecha}</div>
-    </div>
-    <pdf:nextpage />
-    {cuerpo_html}
-    <div id="footer_content">davlerd -- OWASP-grounded security audit -- Confidential to the requesting party</div>
-</body>
-</html>
-"""
+_MD_INLINE_STRIP_RE = re.compile(r"[*_`#]")
 
 
-def _ajustar_anchos_de_columnas(html):
-    """
-    xhtml2pdf ignora table-layout, pero SI respeta un "width" puesto
-    directo en cada celda. Para cada tabla del reporte, mira el texto de
-    los encabezados y le asigna un ancho segun ANCHOS_COLUMNA_POR_ENCABEZADO
-    (columnas con texto/codigo largo como "Input Path" quedan mas anchas
-    que columnas cortas y categoricas como "Risk Level"). El resto del
-    espacio se reparte en partes iguales entre las columnas no reconocidas.
-    """
-    soup = BeautifulSoup(html, "html.parser")
+def _normalize(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    return s
 
-    for tabla in soup.find_all("table"):
-        filas = tabla.find_all("tr")
-        if not filas:
+
+def is_redundant_with_subtitle(subject: str) -> bool:
+    norm_subject = _normalize(subject)
+    norm_subtitle = _normalize(DOC_SUBTITLE)
+    if not norm_subject:
+        return True
+    if norm_subject == norm_subtitle or norm_subtitle.startswith(norm_subject) or norm_subject in norm_subtitle:
+        return True
+    ratio = difflib.SequenceMatcher(None, norm_subject, norm_subtitle).ratio()
+    return ratio >= 0.75
+
+
+def extract_subject_from_md(md_text: str):
+    for raw_line in md_text.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        h_match = re.match(r"^#{1,4}\s+(.*)$", line)
+        if h_match:
+            title = _MD_INLINE_STRIP_RE.sub("", h_match.group(1)).strip()
+            if title:
+                return title
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Parser Markdown -> flowables de reportlab (subset suficiente para reportes)
+# ---------------------------------------------------------------------------
+
+def inline_markup(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(.+?)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"`(.+?)`", r"<font face='Courier'>\1</font>", text)
+
+    def _risk_sub(match):
+        word = match.group(0)
+        color = RISK_COLORS.get(word.lower())
+        if color:
+            return f"<b><font color='{color.hexval()}'>{word}</font></b>"
+        return word
+
+    pattern = r"\b(" + "|".join(sorted(set(RISK_COLORS.keys()), key=len, reverse=True)) + r")\b"
+    text = re.sub(pattern, _risk_sub, text, flags=re.IGNORECASE)
+    return text
+
+
+def parse_table_block(lines, start_idx):
+    rows = []
+    i = start_idx
+    while i < len(lines) and lines[i].strip().startswith("|"):
+        row = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+        if not re.fullmatch(r"\s*-{2,}\s*", "".join(row)) and not all(
+            re.fullmatch(r":?-{2,}:?", c) for c in row
+        ):
+            rows.append(row)
+        i += 1
+    return rows, i
+
+
+def markdown_to_flowables(md_text: str, styles):
+    lines = md_text.replace("\r\n", "\n").split("\n")
+    flow = []
+    i = 0
+    pending_list = []
+    pending_list_type = None
+
+    def flush_list():
+        nonlocal pending_list, pending_list_type
+        if pending_list:
+            items = [ListItem(Paragraph(inline_markup(t), styles["Body"])) for t in pending_list]
+            if pending_list_type == "ul":
+                flow.append(ListFlowable(items, bulletType="bullet", leftIndent=18))
+            else:
+                flow.append(ListFlowable(items, bulletType="1", start="1", leftIndent=18))
+            flow.append(Spacer(1, 6))
+        pending_list = []
+        pending_list_type = None
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if not stripped:
+            flush_list()
+            i += 1
             continue
 
-        celdas_encabezado = filas[0].find_all(["th", "td"])
-        if not celdas_encabezado:
+        if stripped.startswith("|"):
+            flush_list()
+            rows, next_i = parse_table_block(lines, i)
+            if rows:
+                table_data = [
+                    [Paragraph(f"<b>{inline_markup(c)}</b>", styles["TableHead"]) for c in rows[0]]
+                ]
+                for r in rows[1:]:
+                    table_data.append([Paragraph(inline_markup(c), styles["TableCell"]) for c in r])
+                col_count = max(len(r) for r in rows)
+                col_width = (LETTER[0] - 1.6 * inch) / col_count
+                t = Table(table_data, colWidths=[col_width] * col_count, repeatRows=1)
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), PRIMARY_DARK),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F6F8")]),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]))
+                flow.append(t)
+                flow.append(Spacer(1, 10))
+            i = next_i
             continue
 
-        anchos = []
-        reconocidas = 0
-        for celda in celdas_encabezado:
-            clave = celda.get_text(strip=True).lower()
-            ancho = ANCHOS_COLUMNA_POR_ENCABEZADO.get(clave)
-            anchos.append(ancho)
-            if ancho is not None:
-                reconocidas += 1
+        h_match = re.match(r"^(#{1,4})\s+(.*)$", stripped)
+        if h_match:
+            flush_list()
+            level = len(h_match.group(1))
+            text = inline_markup(h_match.group(2))
+            style_name = {1: "H1", 2: "H2", 3: "H3", 4: "H4"}.get(level, "H4")
+            flow.append(Paragraph(text, styles[style_name]))
+            if level <= 2:
+                flow.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#DADEE3"), spaceAfter=8))
+            flow.append(Spacer(1, 4))
+            i += 1
+            continue
 
-        total_reconocido = sum(a for a in anchos if a is not None)
-        cantidad_no_reconocidas = len(anchos) - reconocidas
-        ancho_restante = max(100 - total_reconocido, 0)
-        ancho_por_defecto = (
-            ancho_restante / cantidad_no_reconocidas if cantidad_no_reconocidas else 0
-        )
+        if re.fullmatch(r"-{3,}|\*{3,}|_{3,}", stripped):
+            flush_list()
+            flow.append(HRFlowable(width="100%", thickness=0.75, color=colors.HexColor("#DADEE3")))
+            flow.append(Spacer(1, 8))
+            i += 1
+            continue
 
-        anchos_finales = [a if a is not None else ancho_por_defecto for a in anchos]
+        ul_match = re.match(r"^[-*+]\s+(.*)$", stripped)
+        ol_match = re.match(r"^\d+[.)]\s+(.*)$", stripped)
+        if ul_match or ol_match:
+            list_type = "ul" if ul_match else "ol"
+            if pending_list_type and pending_list_type != list_type:
+                flush_list()
+            pending_list_type = list_type
+            pending_list.append((ul_match or ol_match).group(1))
+            i += 1
+            continue
 
-        # Aplicar el mismo ancho a la columna en TODAS las filas, no solo
-        # el encabezado, para que quede alineado en toda la tabla.
-        for fila in filas:
-            celdas = fila.find_all(["th", "td"])
-            for indice, celda in enumerate(celdas):
-                if indice < len(anchos_finales):
-                    celda["style"] = f"width: {anchos_finales[indice]:.1f}%;"
+        flush_list()
+        para_lines = [stripped]
+        i += 1
+        while i < len(lines) and lines[i].strip() and not re.match(
+            r"^(#{1,4}\s|\||[-*+]\s|\d+[.)]\s|-{3,}$|\*{3,}$|_{3,}$)", lines[i].strip()
+        ):
+            para_lines.append(lines[i].strip())
+            i += 1
+        flow.append(Paragraph(inline_markup(" ".join(para_lines)), styles["Body"]))
+        flow.append(Spacer(1, 6))
 
-    return str(soup)
+    flush_list()
+    return flow
 
 
-def _colorear_severidades(html):
+# ---------------------------------------------------------------------------
+# Estilos
+# ---------------------------------------------------------------------------
+
+def build_styles():
+    base = getSampleStyleSheet()
+    styles = {}
+    styles["Body"] = ParagraphStyle(
+        "Body", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=10.2, leading=14.5,
+        textColor=TEXT_GRAY, spaceAfter=2, alignment=TA_LEFT,
+    )
+    styles["H1"] = ParagraphStyle(
+        "H1", parent=base["Heading1"], fontName=NOMBRE_FUENTE_BOLD, fontSize=17, leading=21,
+        textColor=PRIMARY_DARK, spaceBefore=14, spaceAfter=4,
+    )
+    styles["H2"] = ParagraphStyle(
+        "H2", parent=base["Heading2"], fontName=NOMBRE_FUENTE_BOLD, fontSize=14, leading=18,
+        textColor=PRIMARY_DARK, spaceBefore=12, spaceAfter=4,
+    )
+    styles["H3"] = ParagraphStyle(
+        "H3", parent=base["Heading3"], fontName=NOMBRE_FUENTE_BOLD, fontSize=12, leading=16,
+        textColor=PRIMARY_DARK, spaceBefore=10, spaceAfter=3,
+    )
+    styles["H4"] = ParagraphStyle(
+        "H4", parent=base["Heading4"], fontName=NOMBRE_FUENTE_BOLD, fontSize=11, leading=15,
+        textColor=PRIMARY_DARK, spaceBefore=8, spaceAfter=3,
+    )
+    styles["TableHead"] = ParagraphStyle(
+        "TableHead", parent=base["Normal"], fontName=NOMBRE_FUENTE_BOLD, fontSize=9.5, leading=12,
+        textColor=colors.white,
+    )
+    styles["TableCell"] = ParagraphStyle(
+        "TableCell", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=9.5, leading=12.5,
+        textColor=TEXT_GRAY,
+    )
+    styles["CoverTitle"] = ParagraphStyle(
+        "CoverTitle", parent=base["Title"], fontName=NOMBRE_FUENTE_BOLD, fontSize=30, leading=34,
+        textColor=colors.white, alignment=TA_CENTER, spaceAfter=6,
+    )
+    styles["CoverTagline"] = ParagraphStyle(
+        "CoverTagline", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=11, leading=14,
+        textColor=ACCENT, alignment=TA_CENTER, spaceAfter=40,
+    )
+    styles["CoverSubtitle"] = ParagraphStyle(
+        "CoverSubtitle", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=16, leading=20,
+        textColor=colors.white, alignment=TA_CENTER, spaceAfter=10,
+    )
+    styles["CoverClient"] = ParagraphStyle(
+        "CoverClient", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=18, leading=22,
+        textColor=colors.white, alignment=TA_CENTER, spaceBefore=4, spaceAfter=4,
+    )
+    styles["CoverDate"] = ParagraphStyle(
+        "CoverDate", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=10, leading=13,
+        textColor=colors.HexColor("#B7C4D6"), alignment=TA_CENTER, spaceBefore=60,
+    )
+    return styles
+
+
+# ---------------------------------------------------------------------------
+# Portada y paginas
+# ---------------------------------------------------------------------------
+
+def cover_page(subject, styles, logo_path=None):
+    flow = []
+    flow.append(Spacer(1, 1.3 * inch))
+    if logo_path and os.path.isfile(logo_path):
+        try:
+            img = Image(logo_path, width=1.4 * inch, height=1.4 * inch)
+            img.hAlign = "CENTER"
+            flow.append(img)
+            flow.append(Spacer(1, 18))
+        except Exception:
+            pass
+    flow.append(Paragraph(BRAND_NAME, styles["CoverTitle"]))
+    flow.append(Paragraph(BRAND_TAGLINE, styles["CoverTagline"]))
+    flow.append(Paragraph(DOC_SUBTITLE, styles["CoverSubtitle"]))
+    if not is_redundant_with_subtitle(subject):
+        flow.append(Paragraph(subject, styles["CoverClient"]))
+    flow.append(Paragraph(format_date_en(datetime.now()), styles["CoverDate"]))
+    flow.append(PageBreak())
+    return flow
+
+
+def _cover_background(canvas, doc):
+    canvas.saveState()
+    canvas.setFillColor(PRIMARY_DARK)
+    canvas.rect(0, 0, LETTER[0], LETTER[1], stroke=0, fill=1)
+    canvas.setFillColor(ACCENT)
+    canvas.rect(0, 0, LETTER[0], 0.12 * inch, stroke=0, fill=1)
+    canvas.restoreState()
+
+
+def _content_page(canvas, doc):
+    canvas.saveState()
+    canvas.setFillColor(PRIMARY_DARK)
+    canvas.rect(0, LETTER[1] - 0.42 * inch, LETTER[0], 0.42 * inch, stroke=0, fill=1)
+    canvas.setFillColor(colors.white)
+    canvas.setFont(NOMBRE_FUENTE_BOLD, 9)
+    canvas.drawString(0.7 * inch, LETTER[1] - 0.28 * inch, BRAND_NAME)
+    canvas.setFont(NOMBRE_FUENTE, 9)
+    canvas.drawRightString(LETTER[0] - 0.7 * inch, LETTER[1] - 0.28 * inch, DOC_SUBTITLE)
+
+    canvas.setFillColor(colors.HexColor("#8A8A8A"))
+    canvas.setFont(NOMBRE_FUENTE, 8)
+    canvas.drawCentredString(LETTER[0] / 2, 0.4 * inch, f"Page {doc.page - 1}")
+    canvas.restoreState()
+
+
+def build_pdf(md_path, output_path, logo_path=None, subject=None):
+    """Version original de la skill: lee un .md desde disco y escribe el PDF a disco."""
+    with open(md_path, "r", encoding="utf-8") as f:
+        md_text = f.read()
+    return build_pdf_from_text(md_text, output_path, logo_path=logo_path, subject=subject)
+
+
+def build_pdf_from_text(md_text, output, logo_path=None, subject=None):
     """
-    Le agrega color al texto "[CRITICAL]", "[HIGH]", etc. que ya viene en
-    los titulos de los hallazgos (formato de finding.md), para que salten
-    a la vista en el PDF sin tener que tocar el markdown original.
+    Igual que build_pdf(), pero recibe el texto markdown directo (no una
+    ruta) y `output` puede ser una ruta de archivo O un objeto tipo
+    archivo (ej. io.BytesIO) -- SimpleDocTemplate de reportlab acepta
+    ambos. Devuelve el "asunto" que finalmente se uso en la portada.
     """
-    for severidad, color in COLORES_SEVERIDAD.items():
-        html = html.replace(
-            f"[{severidad}]",
-            f'<span style="color:{color}; font-weight:bold;">[{severidad}]</span>',
-        )
-    return html
+    resolved_subject = subject or extract_subject_from_md(md_text) or DEFAULT_SUBJECT
+    styles = build_styles()
+
+    if not logo_path and DEFAULT_LOGO.is_file():
+        logo_path = str(DEFAULT_LOGO)
+
+    doc = SimpleDocTemplate(
+        output, pagesize=LETTER,
+        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
+        leftMargin=0.8 * inch, rightMargin=0.8 * inch,
+        title=f"{DOC_SUBTITLE} - {resolved_subject}", author=BRAND_NAME,
+    )
+
+    story = []
+    story.extend(cover_page(resolved_subject, styles, logo_path))
+    story.extend(markdown_to_flowables(md_text, styles))
+
+    def on_page(canvas, doc_):
+        if doc_.page == 1:
+            _cover_background(canvas, doc_)
+        else:
+            _content_page(canvas, doc_)
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    return resolved_subject
 
 
-def _insertar_puntos_de_corte_en_codigo(html):
+def generar_pdf_desde_markdown(texto_markdown, titulo=None, fecha=None):
     """
-    xhtml2pdf no soporta word-wrap/overflow-wrap (las ignora directo, sin
-    error): un identificador largo sin espacios dentro de <code> (nombres
-    de funciones como escuchar_comunidad) no se corta de linea solo y se
-    desborda de su celda de tabla. Insertamos un guion suave (soft hyphen,
-    invisible salvo que el renderer corte justo ahi, en cuyo caso se ve
-    como un guion) despues de cada guion bajo -- un espacio de ancho cero
-    (U+200B) se probo primero pero xhtml2pdf no tiene glifo para el en
-    ninguna fuente disponible y lo dibuja como un cuadro visible, el
-    problema opuesto al que se queria resolver. Solo DENTRO de los tags
-    <code> ya convertidos a HTML -- nunca en el markdown crudo (ahi podria
-    confundir al parser con la sintaxis de enfasis "_texto_") ni fuera de
-    <code> (no hace falta, y evita tocar atributos HTML como href).
-    """
+    Punto de entrada que usa webhook_server.py. Mantiene la firma que ya
+    tenia el modulo anterior para no tener que tocar el resto del pipeline.
 
-    def reemplazar(coincidencia):
-        contenido = coincidencia.group(1)
-        return f"<code>{contenido.replace(chr(95), chr(95) + chr(173))}</code>"
+    - titulo: si se pasa, se usa como "asunto" forzado de portada (igual
+      que --subject en el script original). Si se omite (recomendado), el
+      asunto se extrae solo del primer encabezado del propio reporte --
+      no depende del titulo de la tarea de Moltify, que puede ser menos
+      descriptivo que el encabezado real que Claude le puso al reporte.
+    - fecha: no se usa (el script original siempre pone la fecha de
+      generacion real); se deja el parametro solo por compatibilidad de
+      firma con quien llama.
 
-    return re.sub(r"<code>(.*?)</code>", reemplazar, html, flags=re.DOTALL)
-
-
-def generar_pdf_desde_markdown(texto_markdown, titulo, fecha):
-    """
-    Convierte un reporte en markdown (el que devuelve
-    auditoria.realizar_auditoria) a PDF con portada y formato profesional.
     Devuelve los bytes del PDF, o None si algo fallo.
     """
     try:
-        cuerpo_html = md_lib.markdown(
-            texto_markdown, extensions=["tables", "fenced_code", "nl2br"]
-        )
-        cuerpo_html = _ajustar_anchos_de_columnas(cuerpo_html)
-        cuerpo_html = _insertar_puntos_de_corte_en_codigo(cuerpo_html)
-        cuerpo_html = _colorear_severidades(cuerpo_html)
-
-        html_completo = PLANTILLA_HTML.format(
-            titulo=titulo, fecha=fecha, cuerpo_html=cuerpo_html
-        )
-
         buffer_pdf = io.BytesIO()
-        resultado = pisa.CreatePDF(src=html_completo, dest=buffer_pdf, encoding="utf-8")
-
-        if resultado.err:
-            print("[PDF] xhtml2pdf reporto errores al generar el PDF.")
-            return None
-
+        build_pdf_from_text(texto_markdown, buffer_pdf, subject=titulo)
         return buffer_pdf.getvalue()
-
     except Exception:
         print("[PDF] Error inesperado al generar el PDF del reporte.")
         return None
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate the Davlerd PDF report from a .md file")
+    parser.add_argument("md_path", help="Path to the findings/audit .md file")
+    parser.add_argument("--logo", default=None, help="Path to a PNG/JPG logo for the cover")
+    parser.add_argument("--output", default=None, help="Output PDF path")
+    parser.add_argument(
+        "--subject", default=None,
+        help="Text to show on the cover instead of a client name. "
+             "If omitted, the .md's first heading is used.",
+    )
+    args = parser.parse_args()
+
+    with open(args.md_path, "r", encoding="utf-8") as f:
+        subject_guess = args.subject or extract_subject_from_md(f.read()) or DEFAULT_SUBJECT
+
+    if args.output:
+        output_path = args.output
+    else:
+        safe_subject = re.sub(r"[^\w\-() ]+", "", subject_guess).strip() or "Report"
+        safe_subject = safe_subject[:80].strip()
+        output_path = f"{safe_subject} - Davlerd Cybersecurity Report.pdf"
+
+    resolved_subject = build_pdf(args.md_path, output_path, logo_path=args.logo, subject=args.subject)
+    print(f"Cover subject used: {resolved_subject}")
+    if is_redundant_with_subtitle(resolved_subject):
+        print("[info] Subject is redundant with the fixed subtitle; not repeated on the cover.")
+    print(f"PDF generated at: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
