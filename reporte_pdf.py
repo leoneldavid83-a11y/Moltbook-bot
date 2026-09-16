@@ -109,6 +109,56 @@ DEFAULT_LOGO = Path(__file__).parent / "assets" / "davlerd-logo.png"
 
 _MD_INLINE_STRIP_RE = re.compile(r"[*_`#]")
 
+_PAREN_CON_BOTPY_RE = re.compile(r"\([^()]*\bbot\.py\b[^()]*\)", re.IGNORECASE)
+_BOT_PY_BACKTICK_RE = re.compile(r"`\s*bot\.py\s*`", re.IGNORECASE)
+_BOT_PY_SUELTO_RE = re.compile(r"\bbot\.py\b", re.IGNORECASE)
+
+
+def scrub_bot_py_mentions(md_text: str) -> str:
+    """
+    Quita toda mencion literal al texto "bot.py" del reporte (asides entre
+    parentesis que solo existen para referenciarlo, `codigo en linea`, y
+    menciones sueltas), y despues limpia los espacios/puntuacion huerfanos
+    que deja. Es interno/tecnico -- no aporta nada al lector del reporte
+    y en el reporte de auto-auditoria original aparecia varias veces.
+    """
+    lineas = md_text.replace("\r\n", "\n").split("\n")
+    limpias = []
+    for linea in lineas:
+        nueva = _PAREN_CON_BOTPY_RE.sub("", linea)
+        nueva = _BOT_PY_BACKTICK_RE.sub("", nueva)
+        nueva = _BOT_PY_SUELTO_RE.sub("", nueva)
+
+        espacio_inicial = re.match(r"^(\s*)", nueva).group(1)
+        resto = nueva[len(espacio_inicial):]
+        resto = re.sub(r"[ \t]{2,}", " ", resto)
+        resto = re.sub(r"[ \t]+([,.;:!?)])", r"\1", resto)
+        resto = re.sub(r"\(\s*\)", "", resto)
+        resto = resto.rstrip()
+        limpias.append(espacio_inicial + resto)
+    return "\n".join(limpias)
+
+
+def force_document_title(md_text: str, titulo: str = None) -> str:
+    """
+    Reemplaza el primer encabezado del .md (el que describe el sistema
+    auditado especificamente) por un titulo fijo generico, conservando el
+    mismo nivel de encabezado. cover_page() igual omite este primer
+    encabezado en el cuerpo (ver skip_first_h1 en markdown_to_flowables),
+    asi que en la practica esto solo importa para extract_subject_from_md():
+    con el titulo fijo, el "asunto" resuelto siempre coincide con
+    DOC_SUBTITLE y la portada no muestra una segunda linea de asunto.
+    """
+    titulo = titulo or DOC_SUBTITLE
+    lineas = md_text.replace("\r\n", "\n").split("\n")
+    for idx, cruda in enumerate(lineas):
+        linea = cruda.strip()
+        h_match = re.match(r"^(#{1,4})\s+.*$", linea)
+        if h_match:
+            lineas[idx] = f"{h_match.group(1)} {titulo}"
+            break
+    return "\n".join(lineas)
+
 
 def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
@@ -355,13 +405,17 @@ def build_styles():
     styles["TOCPageTitle"] = ParagraphStyle(
         "TOCPageTitle", parent=styles["H1"], spaceAfter=14,
     )
-    styles["TOCLevel1"] = ParagraphStyle(
-        "TOCLevel1", parent=base["Normal"], fontName=NOMBRE_FUENTE_BOLD, fontSize=11.5,
+    styles["TOCLevel0"] = ParagraphStyle(
+        "TOCLevel0", parent=base["Normal"], fontName=NOMBRE_FUENTE_BOLD, fontSize=11.5,
         leading=18, textColor=PRIMARY_DARK, spaceBefore=8,
     )
-    styles["TOCLevel2"] = ParagraphStyle(
-        "TOCLevel2", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=10.5,
+    styles["TOCLevel1"] = ParagraphStyle(
+        "TOCLevel1", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=10.5,
         leading=15, textColor=TEXT_GRAY, leftIndent=16,
+    )
+    styles["TOCLevel2"] = ParagraphStyle(
+        "TOCLevel2", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=9.5,
+        leading=13, textColor=TEXT_GRAY, leftIndent=32,
     )
     return styles
 
@@ -441,13 +495,28 @@ def _cover_background(canvas, doc):
     canvas.restoreState()
 
 
-def _content_page(canvas, doc):
+def _content_page(canvas, doc, logo_path=None):
     canvas.saveState()
     canvas.setFillColor(PRIMARY_DARK)
     canvas.rect(0, LETTER[1] - 0.42 * inch, LETTER[0], 0.42 * inch, stroke=0, fill=1)
+
+    texto_x = 0.7 * inch
+    if logo_path and os.path.isfile(logo_path):
+        try:
+            tamano_icono = 0.26 * inch
+            icono_y = LETTER[1] - 0.42 * inch + (0.42 * inch - tamano_icono) / 2
+            canvas.drawImage(
+                logo_path, 0.5 * inch, icono_y,
+                width=tamano_icono, height=tamano_icono,
+                mask="auto", preserveAspectRatio=True,
+            )
+            texto_x = 0.5 * inch + tamano_icono + 8
+        except Exception:
+            pass
+
     canvas.setFillColor(colors.white)
     canvas.setFont(NOMBRE_FUENTE_BOLD, 9)
-    canvas.drawString(0.7 * inch, LETTER[1] - 0.28 * inch, BRAND_NAME)
+    canvas.drawString(texto_x, LETTER[1] - 0.28 * inch, BRAND_NAME)
     canvas.setFont(NOMBRE_FUENTE, 9)
     canvas.drawRightString(LETTER[0] - 0.7 * inch, LETTER[1] - 0.28 * inch, DOC_SUBTITLE)
 
@@ -460,16 +529,22 @@ def _content_page(canvas, doc):
     canvas.restoreState()
 
 
+# Estilos de encabezado que cuentan como entradas del indice, y a que nivel
+# de anidacion del indice corresponden (H1 y H2 al mismo nivel superior,
+# ya que el H1 real del documento se omite del cuerpo -- ver skip_first_h1).
+TOC_NIVEL_POR_ESTILO = {"H1": 0, "H2": 0, "H3": 1, "H4": 2}
+
+
 def toc_page(styles):
     """
-    Pagina de indice: lista los encabezados H1/H2 del cuerpo con su numero
-    de pagina real. TableOfContents es una "indexing flowable" -- necesita
+    Pagina de indice: lista los encabezados del cuerpo con su numero de
+    pagina real. TableOfContents es una "indexing flowable" -- necesita
     que el documento se construya con doc.multiBuild() (varias pasadas)
     en vez de doc.build(), porque el numero de pagina de cada entrada no
     se sabe hasta haber maquetado el documento completo al menos una vez.
     """
     toc = TableOfContents()
-    toc.levelStyles = [styles["TOCLevel1"], styles["TOCLevel2"]]
+    toc.levelStyles = [styles["TOCLevel0"], styles["TOCLevel1"], styles["TOCLevel2"]]
     return [
         Paragraph("Table of Contents", styles["TOCPageTitle"]),
         toc,
@@ -481,19 +556,21 @@ class ReporteDocTemplate(SimpleDocTemplate):
     """
     SimpleDocTemplate con el gancho que arma el indice: reportlab llama a
     afterFlowable() por cada flowable ya colocado en la pagina, y de ahi
-    se registra cada encabezado H1/H2 del cuerpo (texto + pagina en la que
-    cayo) como una entrada de TableOfContents via notify('TOCEntry', ...).
-    Es el patron que documenta el propio manual de reportlab para indices.
+    se registra cada encabezado del cuerpo (texto + pagina en la que cayo)
+    como una entrada de TableOfContents via notify('TOCEntry', ...). Es el
+    patron que documenta el propio manual de reportlab para indices.
     """
 
     def afterFlowable(self, flowable):
         if not isinstance(flowable, Paragraph):
             return
         style_name = getattr(flowable.style, "name", "")
-        nivel = {"H1": 0, "H2": 1}.get(style_name)
+        nivel = TOC_NIVEL_POR_ESTILO.get(style_name)
         if nivel is None:
             return
-        texto = flowable.getPlainText()
+        texto = flowable.getPlainText().strip()
+        if not texto:
+            return
         # Mismo offset que el pie de pagina: la pagina 3 real es "Page 1".
         self.notify("TOCEntry", (nivel, texto, self.page - 2))
 
@@ -512,6 +589,14 @@ def build_pdf_from_text(md_text, output, logo_path=None, subject=None):
     archivo (ej. io.BytesIO) -- SimpleDocTemplate de reportlab acepta
     ambos. Devuelve el "asunto" que finalmente se uso en la portada.
     """
+    # El titulo especifico del sistema auditado (ej. nombres de archivo
+    # internos) no debe terminar en un reporte de cara al cliente: se
+    # limpia toda mencion a "bot.py" y se fuerza el primer encabezado del
+    # .md a un titulo generico, ANTES de resolver el asunto de portada
+    # (asi el asunto resuelto coincide con DOC_SUBTITLE y no se duplica).
+    md_text = scrub_bot_py_mentions(md_text)
+    md_text = force_document_title(md_text)
+
     resolved_subject = subject or extract_subject_from_md(md_text) or DEFAULT_SUBJECT
     styles = build_styles()
 
@@ -534,7 +619,7 @@ def build_pdf_from_text(md_text, output, logo_path=None, subject=None):
         if doc_.page == 1:
             _cover_background(canvas, doc_)
         else:
-            _content_page(canvas, doc_)
+            _content_page(canvas, doc_, logo_path=logo_path)
 
     doc.multiBuild(story, onFirstPage=on_page, onLaterPages=on_page)
     return resolved_subject
