@@ -36,6 +36,19 @@ PLANTILLA_HTML = """
 <html>
 <head>
 <style>
+    /* DejaVu Sans en vez de Helvetica: tiene cobertura Unicode amplia
+       (flechas, simbolos matematicos, etc.) que Claude a veces usa en los
+       reportes y que Helvetica no puede dibujar (salen como cuadros en
+       blanco). Ya viene instalada en la VM (paquete fonts-dejavu-core). */
+    @font-face {{
+        font-family: "DejaVu Sans";
+        src: url("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+    }}
+    @font-face {{
+        font-family: "DejaVu Sans";
+        font-weight: bold;
+        src: url("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf");
+    }}
     @page {{
         size: A4;
         margin: 2.2cm 1.8cm;
@@ -45,7 +58,7 @@ PLANTILLA_HTML = """
         }}
     }}
     body {{
-        font-family: Helvetica, Arial, sans-serif;
+        font-family: "DejaVu Sans", Helvetica, Arial, sans-serif;
         font-size: 10pt;
         line-height: 1.5;
         color: #1a1a1a;
