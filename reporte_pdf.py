@@ -42,12 +42,12 @@ PLANTILLA_HTML = """
        blanco). Ya viene instalada en la VM (paquete fonts-dejavu-core). */
     @font-face {{
         font-family: "DejaVu Sans";
-        src: url("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+        src: url("fonts/DejaVuSans.ttf");
     }}
     @font-face {{
         font-family: "DejaVu Sans";
         font-weight: bold;
-        src: url("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf");
+        src: url("fonts/DejaVuSans-Bold.ttf");
     }}
     @page {{
         size: A4;
