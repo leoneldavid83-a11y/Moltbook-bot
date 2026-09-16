@@ -336,7 +336,7 @@ def build_styles():
     )
     styles["CoverDate"] = ParagraphStyle(
         "CoverDate", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=10, leading=13,
-        textColor=colors.HexColor("#B7C4D6"), alignment=TA_CENTER, spaceBefore=60,
+        textColor=colors.HexColor("#B7C4D6"), alignment=TA_CENTER, spaceBefore=40,
     )
     return styles
 
@@ -370,6 +370,15 @@ def cover_page(subject, styles, logo_path=None):
                 ("RIGHTPADDING", (0, 0), (-1, -1), 0),
                 ("TOPPADDING", (0, 0), (-1, -1), 0),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                # "DAVLERD" no tiene descendentes (letras como g/j/p que bajan
+                # de la linea base), asi que su tinta visible ocupa solo la
+                # porcion superior de la caja de texto -- el espacio de
+                # descendente que reserva la fuente igual queda ahi, vacio,
+                # abajo. VALIGN MIDDLE centra la CAJA completa (incluido ese
+                # hueco), no la tinta visible, por eso el texto se veia mas
+                # arriba que el centro real del logo. Este padding empuja el
+                # texto hacia abajo dentro de su caja para compensar.
+                ("TOPPADDING", (1, 0), (1, 0), 9),
             ]))
             flow.append(fila_titulo)
             flow.append(Spacer(1, 18))
@@ -382,14 +391,10 @@ def cover_page(subject, styles, logo_path=None):
 
     flow.append(Paragraph(BRAND_TAGLINE, styles["CoverTagline"]))
     flow.append(Paragraph(DOC_SUBTITLE, styles["CoverSubtitle"]))
-    # En vez del asunto largo extraido del primer encabezado del reporte
-    # (ej. "Agent Security Audit: davlerd bot.py..."), la portada ahora
-    # muestra solo la palabra "Report" -- mas limpio. El titulo real del
-    # reporte igual queda en el cuerpo (es el primer encabezado del .md,
-    # se ve completo en la pagina 2). `subject` se sigue calculando y
-    # usando para los metadatos del PDF (doc.title), solo no se muestra
-    # en la portada.
-    flow.append(Paragraph("Report", styles["CoverClient"]))
+    # No se repite "Report" en una linea aparte: ya esta en DOC_SUBTITLE
+    # ("Cybersecurity Audit Report") justo arriba. `subject` se sigue
+    # calculando y usando para los metadatos del PDF (doc.title), solo no
+    # se muestra como texto en la portada.
     flow.append(Paragraph(format_date_en(datetime.now()), styles["CoverDate"]))
     flow.append(PageBreak())
     return flow
