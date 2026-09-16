@@ -313,6 +313,11 @@ def build_styles():
         "CoverTitle", parent=base["Title"], fontName=NOMBRE_FUENTE_BOLD, fontSize=30, leading=34,
         textColor=colors.white, alignment=TA_CENTER, spaceAfter=6,
     )
+    # Variante para cuando el nombre va al lado del logo (no solo, centrado
+    # arriba): alineada a la izquierda dentro de su celda de la tabla.
+    styles["CoverTitleConLogo"] = ParagraphStyle(
+        "CoverTitleConLogo", parent=styles["CoverTitle"], alignment=TA_LEFT,
+    )
     styles["CoverTagline"] = ParagraphStyle(
         "CoverTagline", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=11, leading=14,
         textColor=ACCENT, alignment=TA_CENTER, spaceAfter=40,
@@ -338,16 +343,39 @@ def build_styles():
 
 def cover_page(subject, styles, logo_path=None):
     flow = []
-    flow.append(Spacer(1, 1.3 * inch))
+    flow.append(Spacer(1, 1.4 * inch))
+
+    logo_colocado = False
     if logo_path and os.path.isfile(logo_path):
         try:
-            img = Image(logo_path, width=1.4 * inch, height=1.4 * inch)
-            img.hAlign = "CENTER"
-            flow.append(img)
+            tamano_logo = 0.85 * inch
+            imagen = Image(logo_path, width=tamano_logo, height=tamano_logo)
+            titulo_con_logo = Paragraph(BRAND_NAME, styles["CoverTitleConLogo"])
+            # Tabla de 2 columnas sin bordes: logo | nombre, centrada en
+            # conjunto en la pagina (no cada celda por separado). El ancho
+            # de la 2da columna es None para que se ajuste al texto.
+            fila_titulo = Table(
+                [[imagen, titulo_con_logo]],
+                colWidths=[tamano_logo + 14, None],
+                hAlign="CENTER",
+            )
+            fila_titulo.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (0, 0), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            flow.append(fila_titulo)
             flow.append(Spacer(1, 18))
+            logo_colocado = True
         except Exception:
             pass
-    flow.append(Paragraph(BRAND_NAME, styles["CoverTitle"]))
+
+    if not logo_colocado:
+        flow.append(Paragraph(BRAND_NAME, styles["CoverTitle"]))
+
     flow.append(Paragraph(BRAND_TAGLINE, styles["CoverTagline"]))
     flow.append(Paragraph(DOC_SUBTITLE, styles["CoverSubtitle"]))
     if not is_redundant_with_subtitle(subject):
