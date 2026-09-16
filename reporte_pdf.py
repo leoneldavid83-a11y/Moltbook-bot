@@ -20,7 +20,22 @@ import io
 import re
 
 import markdown as md_lib
+from bs4 import BeautifulSoup
 from xhtml2pdf import pisa
+
+# Anchos de columna (en %) para encabezados de tabla reconocidos. Los que
+# suelen llevar texto/codigo largo (rutas, identificadores) necesitan mas
+# espacio; los categoricos cortos (Risk Level: High/Medium/Low) necesitan
+# poco. Cualquier columna no listada se reparte el espacio restante en
+# partes iguales.
+ANCHOS_COLUMNA_POR_ENCABEZADO = {
+    "input path": 28,
+    "risk level": 12,
+    "location": 22,
+    "confidence": 12,
+    "severity": 12,
+    "access level": 20,
+}
 
 # Colores por severidad, para que los hallazgos se distingan de un
 # vistazo (igual que en cualquier reporte de seguridad real).
@@ -118,6 +133,55 @@ PLANTILLA_HTML = """
 """
 
 
+def _ajustar_anchos_de_columnas(html):
+    """
+    xhtml2pdf ignora table-layout, pero SI respeta un "width" puesto
+    directo en cada celda. Para cada tabla del reporte, mira el texto de
+    los encabezados y le asigna un ancho segun ANCHOS_COLUMNA_POR_ENCABEZADO
+    (columnas con texto/codigo largo como "Input Path" quedan mas anchas
+    que columnas cortas y categoricas como "Risk Level"). El resto del
+    espacio se reparte en partes iguales entre las columnas no reconocidas.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tabla in soup.find_all("table"):
+        filas = tabla.find_all("tr")
+        if not filas:
+            continue
+
+        celdas_encabezado = filas[0].find_all(["th", "td"])
+        if not celdas_encabezado:
+            continue
+
+        anchos = []
+        reconocidas = 0
+        for celda in celdas_encabezado:
+            clave = celda.get_text(strip=True).lower()
+            ancho = ANCHOS_COLUMNA_POR_ENCABEZADO.get(clave)
+            anchos.append(ancho)
+            if ancho is not None:
+                reconocidas += 1
+
+        total_reconocido = sum(a for a in anchos if a is not None)
+        cantidad_no_reconocidas = len(anchos) - reconocidas
+        ancho_restante = max(100 - total_reconocido, 0)
+        ancho_por_defecto = (
+            ancho_restante / cantidad_no_reconocidas if cantidad_no_reconocidas else 0
+        )
+
+        anchos_finales = [a if a is not None else ancho_por_defecto for a in anchos]
+
+        # Aplicar el mismo ancho a la columna en TODAS las filas, no solo
+        # el encabezado, para que quede alineado en toda la tabla.
+        for fila in filas:
+            celdas = fila.find_all(["th", "td"])
+            for indice, celda in enumerate(celdas):
+                if indice < len(anchos_finales):
+                    celda["style"] = f"width: {anchos_finales[indice]:.1f}%;"
+
+    return str(soup)
+
+
 def _colorear_severidades(html):
     """
     Le agrega color al texto "[CRITICAL]", "[HIGH]", etc. que ya viene en
@@ -165,6 +229,7 @@ def generar_pdf_desde_markdown(texto_markdown, titulo, fecha):
         cuerpo_html = md_lib.markdown(
             texto_markdown, extensions=["tables", "fenced_code", "nl2br"]
         )
+        cuerpo_html = _ajustar_anchos_de_columnas(cuerpo_html)
         cuerpo_html = _insertar_puntos_de_corte_en_codigo(cuerpo_html)
         cuerpo_html = _colorear_severidades(cuerpo_html)
 
