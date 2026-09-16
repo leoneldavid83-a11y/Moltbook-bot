@@ -83,25 +83,23 @@ PLANTILLA_HTML = """
     h1 {{ font-size: 16pt; color: #111111; border-bottom: 2px solid #333333; padding-bottom: 4px; }}
     h2 {{ font-size: 13pt; color: #222222; margin-top: 18px; }}
     h3 {{ font-size: 11.5pt; margin-top: 14px; }}
-    /* table-layout fijo + word-wrap: sin esto, xhtml2pdf deja que texto
-       largo sin espacios (nombres de funciones, identificadores) se
-       desborde de la celda en vez de cortar de linea. */
-    table {{ width: 100%; margin: 8px 0; table-layout: fixed; }}
-    th, td {{
-        border: 1px solid #cccccc; padding: 5px 8px; font-size: 8.5pt;
-        text-align: left; word-wrap: break-word; overflow-wrap: break-word;
-    }}
+    /* NOTA: xhtml2pdf ignora table-layout/word-wrap/overflow-wrap sin
+       avisar con error, solo con un warning en consola -- no sirven aca,
+       asi que no se usan. El corte de linea en identificadores largos
+       (nombres de funciones con guion bajo) se resuelve insertando
+       espacios de ancho cero en el HTML, ver _insertar_puntos_de_corte_en_codigo. */
+    table {{ width: 100%; margin: 8px 0; }}
+    th, td {{ border: 1px solid #cccccc; padding: 5px 8px; font-size: 8.5pt; text-align: left; }}
     th {{ background-color: #f0f0f0; }}
-    /* Dentro de celdas de tabla, <code> se ve peor que texto monoespaciado
-       simple: el recuadro con fondo no se ajusta bien cuando el texto
-       hace salto de linea en una columna angosta. Fuera de tablas si
-       mantiene el fondo, que ahi funciona bien. */
+    /* Dentro de celdas de tabla, <code> con fondo propio se ve peor que
+       texto monoespaciado simple cuando hace salto de linea en una
+       columna angosta. Fuera de tablas si mantiene el fondo (ahi funciona
+       bien, ver la regla "code" mas abajo). */
     td code, th code {{
-        font-family: Courier, monospace; font-size: 8pt; background-color: transparent;
-        padding: 0; word-wrap: break-word;
+        font-family: Courier, monospace; font-size: 8pt; background-color: transparent; padding: 0;
     }}
     code {{ background-color: #f2f2f2; padding: 1px 3px; font-family: Courier, monospace; font-size: 8.5pt; }}
-    pre {{ background-color: #f2f2f2; padding: 8px; font-family: Courier, monospace; font-size: 8.5pt; word-wrap: break-word; }}
+    pre {{ background-color: #f2f2f2; padding: 8px; font-family: Courier, monospace; font-size: 8.5pt; }}
     hr {{ border: none; border-top: 1px solid #dddddd; margin: 14px 0; }}
     #footer_content {{ font-size: 8pt; color: #999999; text-align: center; }}
 </style>
@@ -134,6 +132,26 @@ def _colorear_severidades(html):
     return html
 
 
+def _insertar_puntos_de_corte_en_codigo(html):
+    """
+    xhtml2pdf no soporta word-wrap/overflow-wrap (las ignora directo, sin
+    error): un identificador largo sin espacios dentro de <code> (nombres
+    de funciones como escuchar_comunidad) no se corta de linea solo y se
+    desborda de su celda de tabla. Insertamos un espacio de ancho cero
+    (invisible, no cambia como se ve el texto) despues de cada guion bajo,
+    solo DENTRO de los tags <code> ya convertidos a HTML -- nunca en el
+    markdown crudo (ahi podria confundir al parser con la sintaxis de
+    enfasis "_texto_") ni fuera de <code> (no hace falta, y evita tocar
+    atributos HTML como href por error).
+    """
+
+    def reemplazar(coincidencia):
+        contenido = coincidencia.group(1)
+        return f"<code>{contenido.replace(chr(95), chr(95) + chr(8203))}</code>"
+
+    return re.sub(r"<code>(.*?)</code>", reemplazar, html, flags=re.DOTALL)
+
+
 def generar_pdf_desde_markdown(texto_markdown, titulo, fecha):
     """
     Convierte un reporte en markdown (el que devuelve
@@ -144,6 +162,7 @@ def generar_pdf_desde_markdown(texto_markdown, titulo, fecha):
         cuerpo_html = md_lib.markdown(
             texto_markdown, extensions=["tables", "fenced_code", "nl2br"]
         )
+        cuerpo_html = _insertar_puntos_de_corte_en_codigo(cuerpo_html)
         cuerpo_html = _colorear_severidades(cuerpo_html)
 
         html_completo = PLANTILLA_HTML.format(
