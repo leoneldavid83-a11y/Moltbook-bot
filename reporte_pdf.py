@@ -45,6 +45,7 @@ from reportlab.platypus import (
     HRFlowable, Image, ListFlowable, ListItem, PageBreak, Paragraph,
     SimpleDocTemplate, Spacer, Table, TableStyle,
 )
+from reportlab.platypus.tableofcontents import TableOfContents
 
 # ---------------------------------------------------------------------------
 # Fuente Unicode: se registra una sola vez al importar el modulo. Sin esto,
@@ -172,12 +173,18 @@ def parse_table_block(lines, start_idx):
     return rows, i
 
 
-def markdown_to_flowables(md_text: str, styles):
+def markdown_to_flowables(md_text: str, styles, skip_first_h1=True):
     lines = md_text.replace("\r\n", "\n").split("\n")
     flow = []
     i = 0
     pending_list = []
     pending_list_type = None
+    # El primer "#" del .md es el titulo general del documento -- ya se usa
+    # como asunto de portada (extract_subject_from_md), asi que mostrarlo
+    # tambien como encabezado en el cuerpo es redundante. Se omite una sola
+    # vez (la primera vez que aparece un nivel 1); el resto de los "#" del
+    # documento (si los hay) se muestran normalmente.
+    primer_h1_pendiente = skip_first_h1
 
     def flush_list():
         nonlocal pending_list, pending_list_type
@@ -232,6 +239,10 @@ def markdown_to_flowables(md_text: str, styles):
         if h_match:
             flush_list()
             level = len(h_match.group(1))
+            if level == 1 and primer_h1_pendiente:
+                primer_h1_pendiente = False
+                i += 1
+                continue
             text = inline_markup(h_match.group(2))
             style_name = {1: "H1", 2: "H2", 3: "H3", 4: "H4"}.get(level, "H4")
             flow.append(Paragraph(text, styles[style_name]))
@@ -338,6 +349,20 @@ def build_styles():
         "CoverDate", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=10, leading=13,
         textColor=colors.HexColor("#B7C4D6"), alignment=TA_CENTER, spaceBefore=40,
     )
+    # Estilo separado (no "H1") para el titulo de la pagina de indice: si
+    # usara el estilo "H1", ReporteDocTemplate.afterFlowable() lo tomaria
+    # como una entrada mas del propio indice, apuntandose a si mismo.
+    styles["TOCPageTitle"] = ParagraphStyle(
+        "TOCPageTitle", parent=styles["H1"], spaceAfter=14,
+    )
+    styles["TOCLevel1"] = ParagraphStyle(
+        "TOCLevel1", parent=base["Normal"], fontName=NOMBRE_FUENTE_BOLD, fontSize=11.5,
+        leading=18, textColor=PRIMARY_DARK, spaceBefore=8,
+    )
+    styles["TOCLevel2"] = ParagraphStyle(
+        "TOCLevel2", parent=base["Normal"], fontName=NOMBRE_FUENTE, fontSize=10.5,
+        leading=15, textColor=TEXT_GRAY, leftIndent=16,
+    )
     return styles
 
 
@@ -426,10 +451,51 @@ def _content_page(canvas, doc):
     canvas.setFont(NOMBRE_FUENTE, 9)
     canvas.drawRightString(LETTER[0] - 0.7 * inch, LETTER[1] - 0.28 * inch, DOC_SUBTITLE)
 
-    canvas.setFillColor(colors.HexColor("#8A8A8A"))
-    canvas.setFont(NOMBRE_FUENTE, 8)
-    canvas.drawCentredString(LETTER[0] / 2, 0.4 * inch, f"Page {doc.page - 1}")
+    # Pagina 1 = portada, pagina 2 = indice (sin numerar, es "front matter"),
+    # el contenido real arranca en "Page 1" a partir de la pagina 3.
+    if doc.page > 2:
+        canvas.setFillColor(colors.HexColor("#8A8A8A"))
+        canvas.setFont(NOMBRE_FUENTE, 8)
+        canvas.drawCentredString(LETTER[0] / 2, 0.4 * inch, f"Page {doc.page - 2}")
     canvas.restoreState()
+
+
+def toc_page(styles):
+    """
+    Pagina de indice: lista los encabezados H1/H2 del cuerpo con su numero
+    de pagina real. TableOfContents es una "indexing flowable" -- necesita
+    que el documento se construya con doc.multiBuild() (varias pasadas)
+    en vez de doc.build(), porque el numero de pagina de cada entrada no
+    se sabe hasta haber maquetado el documento completo al menos una vez.
+    """
+    toc = TableOfContents()
+    toc.levelStyles = [styles["TOCLevel1"], styles["TOCLevel2"]]
+    return [
+        Paragraph("Table of Contents", styles["TOCPageTitle"]),
+        toc,
+        PageBreak(),
+    ]
+
+
+class ReporteDocTemplate(SimpleDocTemplate):
+    """
+    SimpleDocTemplate con el gancho que arma el indice: reportlab llama a
+    afterFlowable() por cada flowable ya colocado en la pagina, y de ahi
+    se registra cada encabezado H1/H2 del cuerpo (texto + pagina en la que
+    cayo) como una entrada de TableOfContents via notify('TOCEntry', ...).
+    Es el patron que documenta el propio manual de reportlab para indices.
+    """
+
+    def afterFlowable(self, flowable):
+        if not isinstance(flowable, Paragraph):
+            return
+        style_name = getattr(flowable.style, "name", "")
+        nivel = {"H1": 0, "H2": 1}.get(style_name)
+        if nivel is None:
+            return
+        texto = flowable.getPlainText()
+        # Mismo offset que el pie de pagina: la pagina 3 real es "Page 1".
+        self.notify("TOCEntry", (nivel, texto, self.page - 2))
 
 
 def build_pdf(md_path, output_path, logo_path=None, subject=None):
@@ -452,7 +518,7 @@ def build_pdf_from_text(md_text, output, logo_path=None, subject=None):
     if not logo_path and DEFAULT_LOGO.is_file():
         logo_path = str(DEFAULT_LOGO)
 
-    doc = SimpleDocTemplate(
+    doc = ReporteDocTemplate(
         output, pagesize=LETTER,
         topMargin=0.75 * inch, bottomMargin=0.75 * inch,
         leftMargin=0.8 * inch, rightMargin=0.8 * inch,
@@ -461,6 +527,7 @@ def build_pdf_from_text(md_text, output, logo_path=None, subject=None):
 
     story = []
     story.extend(cover_page(resolved_subject, styles, logo_path))
+    story.extend(toc_page(styles))
     story.extend(markdown_to_flowables(md_text, styles))
 
     def on_page(canvas, doc_):
@@ -469,7 +536,7 @@ def build_pdf_from_text(md_text, output, logo_path=None, subject=None):
         else:
             _content_page(canvas, doc_)
 
-    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    doc.multiBuild(story, onFirstPage=on_page, onLaterPages=on_page)
     return resolved_subject
 
 
