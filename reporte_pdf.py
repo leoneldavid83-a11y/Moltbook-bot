@@ -357,10 +357,17 @@ def cover_page(subject, styles, logo_path=None):
             titulo_con_logo = Paragraph(BRAND_NAME, styles["CoverTitleConLogo"])
             # Tabla de 2 columnas sin bordes: logo | nombre, centrada en
             # conjunto en la pagina (no cada celda por separado). El ancho
-            # de la 2da columna es None para que se ajuste al texto.
+            # de la 2da columna se calcula con el ancho real del texto
+            # (stringWidth) en vez de dejarlo en None: con None, reportlab
+            # le da a esa columna un ancho de "auto" que termina siendo
+            # mucho mayor al texto real, y aunque la tabla completa queda
+            # "centrada" (hAlign=CENTER), ese hueco invisible a la derecha
+            # del texto desplaza todo el grupo logo+nombre hacia la
+            # izquierda respecto al resto de las lineas centradas debajo.
+            ancho_titulo = pdfmetrics.stringWidth(BRAND_NAME, NOMBRE_FUENTE_BOLD, 30)
             fila_titulo = Table(
                 [[imagen, titulo_con_logo]],
-                colWidths=[tamano_logo + 14, None],
+                colWidths=[tamano_logo + 14, ancho_titulo + 4],
                 hAlign="CENTER",
             )
             fila_titulo.setStyle(TableStyle([
