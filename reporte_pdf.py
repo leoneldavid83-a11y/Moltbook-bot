@@ -83,11 +83,25 @@ PLANTILLA_HTML = """
     h1 {{ font-size: 16pt; color: #111111; border-bottom: 2px solid #333333; padding-bottom: 4px; }}
     h2 {{ font-size: 13pt; color: #222222; margin-top: 18px; }}
     h3 {{ font-size: 11.5pt; margin-top: 14px; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 8px 0; }}
-    th, td {{ border: 1px solid #cccccc; padding: 5px 8px; font-size: 9pt; text-align: left; }}
+    /* table-layout fijo + word-wrap: sin esto, xhtml2pdf deja que texto
+       largo sin espacios (nombres de funciones, identificadores) se
+       desborde de la celda en vez de cortar de linea. */
+    table {{ width: 100%; margin: 8px 0; table-layout: fixed; }}
+    th, td {{
+        border: 1px solid #cccccc; padding: 5px 8px; font-size: 8.5pt;
+        text-align: left; word-wrap: break-word; overflow-wrap: break-word;
+    }}
     th {{ background-color: #f0f0f0; }}
+    /* Dentro de celdas de tabla, <code> se ve peor que texto monoespaciado
+       simple: el recuadro con fondo no se ajusta bien cuando el texto
+       hace salto de linea en una columna angosta. Fuera de tablas si
+       mantiene el fondo, que ahi funciona bien. */
+    td code, th code {{
+        font-family: Courier, monospace; font-size: 8pt; background-color: transparent;
+        padding: 0; word-wrap: break-word;
+    }}
     code {{ background-color: #f2f2f2; padding: 1px 3px; font-family: Courier, monospace; font-size: 8.5pt; }}
-    pre {{ background-color: #f2f2f2; padding: 8px; font-family: Courier, monospace; font-size: 8.5pt; }}
+    pre {{ background-color: #f2f2f2; padding: 8px; font-family: Courier, monospace; font-size: 8.5pt; word-wrap: break-word; }}
     hr {{ border: none; border-top: 1px solid #dddddd; margin: 14px 0; }}
     #footer_content {{ font-size: 8pt; color: #999999; text-align: center; }}
 </style>
