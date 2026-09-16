@@ -137,17 +137,20 @@ def _insertar_puntos_de_corte_en_codigo(html):
     xhtml2pdf no soporta word-wrap/overflow-wrap (las ignora directo, sin
     error): un identificador largo sin espacios dentro de <code> (nombres
     de funciones como escuchar_comunidad) no se corta de linea solo y se
-    desborda de su celda de tabla. Insertamos un espacio de ancho cero
-    (invisible, no cambia como se ve el texto) despues de cada guion bajo,
-    solo DENTRO de los tags <code> ya convertidos a HTML -- nunca en el
-    markdown crudo (ahi podria confundir al parser con la sintaxis de
-    enfasis "_texto_") ni fuera de <code> (no hace falta, y evita tocar
-    atributos HTML como href por error).
+    desborda de su celda de tabla. Insertamos un guion suave (soft hyphen,
+    invisible salvo que el renderer corte justo ahi, en cuyo caso se ve
+    como un guion) despues de cada guion bajo -- un espacio de ancho cero
+    (U+200B) se probo primero pero xhtml2pdf no tiene glifo para el en
+    ninguna fuente disponible y lo dibuja como un cuadro visible, el
+    problema opuesto al que se queria resolver. Solo DENTRO de los tags
+    <code> ya convertidos a HTML -- nunca en el markdown crudo (ahi podria
+    confundir al parser con la sintaxis de enfasis "_texto_") ni fuera de
+    <code> (no hace falta, y evita tocar atributos HTML como href).
     """
 
     def reemplazar(coincidencia):
         contenido = coincidencia.group(1)
-        return f"<code>{contenido.replace(chr(95), chr(95) + chr(8203))}</code>"
+        return f"<code>{contenido.replace(chr(95), chr(95) + chr(173))}</code>"
 
     return re.sub(r"<code>(.*?)</code>", reemplazar, html, flags=re.DOTALL)
 
