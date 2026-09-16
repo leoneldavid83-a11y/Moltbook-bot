@@ -186,7 +186,14 @@ def salud():
 
 
 if __name__ == "__main__":
+    # Waitress en vez de app.run(): el servidor de desarrollo de Flask no
+    # esta pensado para manejar trafico real (es de un solo hilo por
+    # default). Waitress es liviano (puro Python, sin dependencias
+    # pesadas) y le alcanza de sobra a una VM de 1GB.
+    #
     # Solo escucha en localhost: el unico que le habla directo es Caddy
     # (reverse proxy con HTTPS), que corre en la misma maquina. Nunca
     # expuesto directo a internet sin el proxy.
-    app.run(host="127.0.0.1", port=8000)
+    from waitress import serve
+
+    serve(app, host="127.0.0.1", port=8000, threads=4)
