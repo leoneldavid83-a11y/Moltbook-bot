@@ -123,12 +123,33 @@ def recibir_webhook():
 
 def _procesar_tarea(tarea):
     """
-    Corre la auditoria real (puede tardar varios minutos con esfuerzo
-    alto) y entrega el resultado. Vive en su propio hilo para no bloquear
-    la respuesta rapida que ya se le dio al webhook.
+    Vive en su propio hilo para no bloquear la respuesta rapida que ya se
+    le dio al webhook (Moltify exige 200 OK en menos de 30s).
+
+    - Si es una tarea de PRUEBA (Moltify manda "test": true en data para
+      el boton "Test Connection"), respondemos de inmediato sin correr
+      nada real -- si intentaramos una auditoria de verdad aca, el test
+      de Moltify expira a los 15s esperando el callback y nunca llegariamos
+      a tiempo (esto paso literalmente la primera vez que probamos).
+    - Si es una tarea REAL: primero confirmamos recepcion ("accept", rapido),
+      despues corremos la auditoria de verdad (puede tardar varios minutos
+      con esfuerzo alto) y recien ahi entregamos el resultado final
+      ("deliver").
     """
     task_id = tarea.get("taskId")
     callback_url = tarea.get("callbackUrl")
+
+    if tarea.get("test"):
+        print(f"[WEBHOOK] Tarea de prueba ({task_id}): respondo sin correr una auditoria real.")
+        _enviar_callback(callback_url, "deliver", "Test received -- davlerd's audit pipeline is online and ready.")
+        return
+
+    print(f"[WEBHOOK] Confirmando recepcion de la tarea real {task_id}...")
+    _enviar_callback(
+        callback_url, "accept",
+        "Starting the security audit now -- a real OWASP-based review takes a few minutes, not seconds.",
+    )
+
     descripcion = tarea.get("description", "")
     requerimientos = tarea.get("requirements", "")
 
@@ -139,23 +160,23 @@ def _procesar_tarea(tarea):
     )
 
     if not reporte:
-        print(f"[WEBHOOK] La auditoria de la tarea {task_id} fallo; no se entrega nada.")
+        print(f"[WEBHOOK] La auditoria de la tarea {task_id} fallo; no se entrega el reporte final.")
         return
 
     if len(reporte) > MAX_CARACTERES_ENTREGA:
         reporte = reporte[:MAX_CARACTERES_ENTREGA]
 
-    _entregar_resultado(callback_url, reporte)
+    _enviar_callback(callback_url, "deliver", reporte)
 
 
-def _entregar_resultado(callback_url, contenido):
-    """Entrega el resultado terminado a Moltify via el callback firmado."""
+def _enviar_callback(callback_url, accion, contenido):
+    """Envia un callback firmado a Moltify. accion: 'accept' o 'deliver'."""
     if not callback_url:
         print("[WEBHOOK] La tarea no trajo callbackUrl; no se puede entregar nada.")
         return
 
     timestamp = str(int(time.time() * 1000))
-    cuerpo_json_str = json.dumps({"action": "deliver", "content": contenido})
+    cuerpo_json_str = json.dumps({"action": accion, "content": contenido})
     firma = _firmar(timestamp, cuerpo_json_str)
 
     cabeceras = {
@@ -167,13 +188,13 @@ def _entregar_resultado(callback_url, contenido):
     try:
         respuesta = requests.post(callback_url, data=cuerpo_json_str, headers=cabeceras, timeout=15)
         respuesta.raise_for_status()
-        print("[WEBHOOK] Resultado entregado correctamente.")
+        print(f"[WEBHOOK] Callback '{accion}' entregado correctamente.")
     except requests.exceptions.Timeout:
-        print("[WEBHOOK] Error: tiempo de espera agotado al entregar el resultado.")
+        print(f"[WEBHOOK] Error: tiempo de espera agotado al enviar el callback '{accion}'.")
     except requests.exceptions.HTTPError:
-        print("[WEBHOOK] Error HTTP al entregar el resultado.")
+        print(f"[WEBHOOK] Error HTTP al enviar el callback '{accion}'.")
     except requests.exceptions.RequestException:
-        print("[WEBHOOK] Error de conexion al entregar el resultado.")
+        print(f"[WEBHOOK] Error de conexion al enviar el callback '{accion}'.")
 
 
 @app.route("/health", methods=["GET"])
