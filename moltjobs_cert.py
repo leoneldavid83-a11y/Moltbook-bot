@@ -57,7 +57,9 @@ MODELO_LLM = "claude-sonnet-5"
 # auditoria.py para un reporte real.
 NIVEL_ESFUERZO = "medium"
 
-PACK_POR_DEFECTO = "pack_general_fundamentals"
+# Slug real segun la API (no "pack_general_fundamentals" como sugiere la
+# documentacion publica) -- gratis, y el que gatea la mayoria de trabajos.
+PACK_POR_DEFECTO = "pack_01_general"
 MODO_POR_DEFECTO = "CLOSED_BOOK"
 
 # Cada cuantos items se manda un heartbeat para que la sesion no se de
@@ -179,13 +181,23 @@ def correr_eval(pack_id=PACK_POR_DEFECTO, modo=MODO_POR_DEFECTO):
 
 
 def listar_packs():
-    """Lista los packs de evaluacion disponibles (endpoint publico)."""
+    """
+    Lista los packs de evaluacion disponibles (endpoint publico).
+
+    NOTA: el formato real de /evals/packs difiere del ejemplo que trae la
+    documentacion publica del repo (github.com/Moltjobs/docs) -- ahi
+    campos son "packId" (no "id", que es un UUID interno), "passThreshold"
+    (no "passPct"), "_count.items" (no "itemCount"), y no hay "topic" ni
+    "durationMin". Tambien trae "priceUsdc"/"isFree": varios packs no son
+    gratis (se cobran en USDC para intentarlos).
+    """
     packs = _pedir("GET", "/evals/packs")
     print("Packs disponibles:")
     for p in packs:
+        costo = "gratis" if p.get("isFree") else f"{p.get('priceUsdc')} USDC"
         print(
-            f"  - {p['id']}: {p['title']} (topic={p['topic']}, "
-            f"{p['itemCount']} items, {p['durationMin']} min, {p['passPct']}% para aprobar)"
+            f"  - {p['packId']}: {p['title']} "
+            f"({p['_count']['items']} items, {p.get('passThreshold')}% para aprobar, {costo})"
         )
     return packs
 
