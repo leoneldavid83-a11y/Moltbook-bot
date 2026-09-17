@@ -35,6 +35,8 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 
 import estadisticas
+import moltjobs_marketplace
+import moltjobs_state
 from auditoria import SKILLS_DISPONIBLES, elegir_skill_para_tarea, realizar_auditoria
 from reporte_pdf import generar_pdf_desde_markdown
 
@@ -51,6 +53,20 @@ if not MOLTIFY_WEBHOOK_SECRET:
     print("[WEBHOOK] ADVERTENCIA: falta MOLTIFY_WEBHOOK_SECRET en .env.")
     print("[WEBHOOK] El servidor va a rechazar todas las peticiones hasta que se complete.")
 
+# Secreto de firma del webhook de MoltJobs (distinto del de Moltify).
+# MoltJobs no lo devolvio al registrar el webhook via API -- hay que
+# buscarlo en el dashboard (app.moltjobs.io), seccion Connectivity.
+MOLTJOBS_WEBHOOK_SECRET = os.getenv("MOLTJOBS_WEBHOOK_SECRET")
+
+if not MOLTJOBS_WEBHOOK_SECRET:
+    print("[WEBHOOK] ADVERTENCIA: falta MOLTJOBS_WEBHOOK_SECRET en .env.")
+    print("[WEBHOOK] /webhooks/moltjobs va a rechazar todas las peticiones hasta que se complete.")
+
+# El "id" (handle) con el que se registro el agente en MoltJobs -- se usa
+# para confirmar que un evento job.updated es sobre UN TRABAJO NUESTRO
+# antes de actuar.
+MOLTJOBS_AGENT_ID = "davlerd"
+
 # Credenciales del dashboard privado de estadisticas (/dashboard). Si
 # DASHBOARD_PASSWORD no esta configurada, el endpoint rechaza todo --
 # mismo criterio de "seguro por defecto" que MOLTIFY_WEBHOOK_SECRET.
@@ -63,6 +79,7 @@ if not DASHBOARD_PASSWORD:
 
 app = Flask(__name__)
 estadisticas.inicializar_base_datos()
+moltjobs_state.inicializar_base_datos()
 
 # Moltify exige max 50.000 caracteres en el campo "content" al entregar un
 # resultado. Con max_tokens=16000 en auditoria.py, un reporte muy largo
@@ -309,22 +326,159 @@ def salud():
     return jsonify({"status": "ok", "agent": "davlerd"}), 200
 
 
+def _verificar_firma_moltjobs(cuerpo_crudo, header_valor):
+    """
+    Verifica la firma del header "MoltJobs-Signature: t=<ts>,v1=<hmac>"
+    (formato segun guides/webhooks.md del repo de MoltJobs -- no
+    confirmado contra una entrega real todavia, ver comentario en la
+    ruta de abajo). HMAC-SHA256 sobre "{timestamp}.{cuerpo_crudo}",
+    mas rechazo de firmas de mas de 5 minutos (proteccion anti-replay).
+    """
+    if not MOLTJOBS_WEBHOOK_SECRET or not header_valor:
+        return False
+    try:
+        partes = dict(kv.split("=", 1) for kv in header_valor.split(","))
+        timestamp = partes["t"]
+        firma_recibida = partes["v1"]
+    except (KeyError, ValueError):
+        return False
+
+    mensaje = f"{timestamp}.{cuerpo_crudo.decode('utf-8')}"
+    firma_esperada = hmac.new(
+        MOLTJOBS_WEBHOOK_SECRET.encode("utf-8"), mensaje.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(firma_esperada, firma_recibida):
+        return False
+
+    try:
+        return abs(time.time() - int(timestamp)) <= 300
+    except ValueError:
+        return False
+
+
 @app.route("/webhooks/moltjobs", methods=["POST"])
-def recibir_webhook_moltjobs_debug():
+def recibir_webhook_moltjobs():
     """
-    TEMPORAL: la guia publica de MoltJobs (webhooks.md) describe firma
-    HMAC en el header "MoltJobs-Signature", pero al registrar el webhook
-    via API no devolvio ningun secreto -- antes de implementar
-    verificacion de firma hay que ver que llega realmente. Este handler
-    solo loguea headers + body crudo y devuelve 200, sin verificar nada
-    todavia. Se reemplaza por el handler real en cuanto se confirme el
-    formato contra una entrega de prueba real.
+    Punto de entrada de MoltJobs. A diferencia de Moltify (un evento
+    "task.submitted" por tarea), MoltJobs manda solo dos tipos de evento
+    a este webhook segun su propio dashboard: "job.updated" (cualquier
+    cambio de estado de un trabajo, incluida la asignacion) y
+    "message.created" (mensaje de chat directo). No hay un tipo de
+    evento para "trabajo nuevo publicado" -- el descubrimiento de
+    trabajos nuevos lo hace moltjobs_discover.py por polling periodico
+    (via systemd timer), no este webhook.
+
+    Se loguean los headers si la firma falla, para poder diagnosticar
+    si MOLTJOBS_WEBHOOK_SECRET esta mal o si el formato real de la firma
+    resulta distinto al documentado (ya paso con otras partes de esta
+    API -- ver moltjobs_cert.py y moltjobs_marketplace.py).
     """
-    print("[MOLTJOBS-DEBUG] Headers recibidos:")
-    for nombre, valor in request.headers.items():
-        print(f"  {nombre}: {valor}")
-    print(f"[MOLTJOBS-DEBUG] Body crudo: {request.get_data(as_text=True)}")
+    cuerpo_crudo = request.get_data()
+    firma_header = request.headers.get("MoltJobs-Signature")
+
+    if not _verificar_firma_moltjobs(cuerpo_crudo, firma_header):
+        print("[MOLTJOBS] Firma invalida o ausente -- peticion rechazada. Headers recibidos:")
+        for nombre, valor in request.headers.items():
+            if nombre.lower() not in ("authorization", "cookie"):
+                print(f"  {nombre}: {valor}")
+        return jsonify({"error": "invalid signature"}), 401
+
+    evento = request.get_json(silent=True) or {}
+    print(f"[MOLTJOBS] Evento recibido: {evento.get('type')} ({evento.get('id')})")
+
+    hilo = threading.Thread(target=_procesar_evento_moltjobs, args=(evento,), daemon=True)
+    hilo.start()
+
     return jsonify({"received": True}), 200
+
+
+def _procesar_evento_moltjobs(evento):
+    """
+    Vive en su propio hilo, igual que _procesar_tarea() para Moltify.
+
+    - "message.created": solo se loguea por ahora (sin auto-respuesta de
+      chat en esta fase).
+    - "job.updated" con status ASSIGNED para un trabajo nuestro: dispara
+      la ejecucion completa (marcar iniciado -> auditoria real ->
+      entregar). Cualquier otro status de job.updated (SUBMITTED,
+      APPROVED, PAID, etc.) se ignora -- no requiere accion nuestra, ya
+      la disparamos nosotros mismos al entregar.
+
+    POLITICA DE RETENCION DE DATOS: igual que _procesar_tarea() para
+    Moltify -- el titulo/descripcion del trabajo y el reporte generado
+    se borran de memoria (`del`, en el finally) apenas se entrega o
+    falla, nunca se escriben a disco.
+    """
+    tipo = evento.get("type")
+    datos = evento.get("data") or {}
+
+    if tipo == "message.created":
+        print(f"[MOLTJOBS] Mensaje de chat recibido (sin auto-respuesta todavia): {datos.get('id')}")
+        return
+
+    if tipo != "job.updated":
+        print(f"[MOLTJOBS] Evento sin manejar todavia: {tipo}")
+        return
+
+    job_id = datos.get("jobId") or datos.get("id")
+    if not job_id:
+        print("[MOLTJOBS] Evento job.updated sin jobId; se ignora.")
+        return
+
+    # Se vuelve a pedir el detalle completo del trabajo en vez de confiar
+    # en el contenido del payload del webhook (cuyo formato exacto no
+    # esta documentado de forma confiable) -- la API es la fuente de
+    # verdad.
+    try:
+        trabajo = moltjobs_marketplace.obtener_trabajo(job_id)
+    except Exception:
+        print(f"[MOLTJOBS] Error al obtener el detalle del trabajo {job_id}.")
+        return
+
+    if trabajo.get("agentId") != MOLTJOBS_AGENT_ID or trabajo.get("status") != "ASSIGNED":
+        return
+
+    # Idempotencia: si job.updated llega repetido para la misma
+    # asignacion (reintentos del lado de MoltJobs), no reprocesar un
+    # trabajo que ya se empezo, entrego, o fallo en una corrida anterior.
+    if moltjobs_state.obtener_estado(job_id) in ("asignado", "entregado", "error"):
+        print(f"[MOLTJOBS] Trabajo {job_id} ya estaba en estado '{moltjobs_state.obtener_estado(job_id)}'; se ignora el evento repetido.")
+        return
+
+    titulo = trabajo.get("title", "")
+    descripcion = None
+    reporte = None
+    try:
+        descripcion = (trabajo.get("inputData") or {}).get("generalDescription") or titulo
+        criterios = trabajo.get("acceptanceCriteria") or []
+        criterios_texto = "\n".join(f"- {c.get('description', '')}" for c in criterios if c.get("description"))
+        contenido_objetivo = f"{descripcion}\n\nAcceptance criteria:\n{criterios_texto}" if criterios_texto else descripcion
+
+        moltjobs_state.marcar_estado(job_id, "asignado")
+        print(f"[MOLTJOBS] Trabajo {job_id} asignado -- iniciando ejecucion.")
+
+        try:
+            moltjobs_marketplace.marcar_iniciado(job_id)
+        except Exception:
+            print(f"[MOLTJOBS] Error al marcar el trabajo {job_id} como iniciado (se continua igual).")
+
+        tipo_skill = elegir_skill_para_tarea(titulo, descripcion, "")
+        reporte = realizar_auditoria(tipo_skill, contenido_objetivo=contenido_objetivo, contexto_adicional=titulo)
+
+        if not reporte:
+            print(f"[MOLTJOBS] La auditoria del trabajo {job_id} fallo; no se entrega.")
+            moltjobs_state.marcar_estado(job_id, "error")
+            return
+
+        moltjobs_marketplace.entregar_trabajo(job_id, reporte)
+        moltjobs_state.marcar_estado(job_id, "entregado")
+        print(f"[MOLTJOBS] Trabajo {job_id} entregado.")
+    except Exception:
+        print(f"[MOLTJOBS] Error inesperado procesando el trabajo {job_id}.")
+        moltjobs_state.marcar_estado(job_id, "error")
+    finally:
+        del titulo, descripcion, reporte
 
 
 def _autenticacion_dashboard_valida():
