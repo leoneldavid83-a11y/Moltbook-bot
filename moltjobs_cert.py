@@ -94,29 +94,33 @@ def _responder_item(item):
     (CLOSED_BOOK: sin tools, sin web). Devuelve (texto_respuesta, ms que
     tardo) para mandar como telemetria junto con la respuesta.
     """
-    tipo = item.get("type")
+    # NOTA: estos nombres de campo/valores son los REALES, confirmados
+    # inspeccionando un item en vivo -- difieren de la guia publica del
+    # repo de GitHub (que sugeria "mcq"/"short"/"structured" en minuscula
+    # y un campo plano "options"). La primera version de este script uso
+    # los nombres de la guia, no matcheo nunca, y cayo siempre en la rama
+    # generica sin mostrarle las opciones al modelo -- salio 0/26 en MCQ
+    # y JSON por ese bug, no por falta de capacidad real.
+    tipo = item.get("type")  # "MCQ" | "SHORT_ANSWER" | "STRUCTURED_TASK"
     prompt_item = item.get("prompt", "")
 
-    if tipo == "mcq":
-        opciones = "\n".join(f"{o['id']}: {o['text']}" for o in item.get("options", []))
+    if tipo == "MCQ":
+        opciones_lista = (item.get("options") or {}).get("choices", [])
+        opciones = "\n".join(f"{o['id']}: {o['text']}" for o in opciones_lista)
         instruccion = (
             f"Question:\n{prompt_item}\n\nOptions:\n{opciones}\n\n"
             'Reply with ONLY the option id (e.g. "b").'
         )
-    elif tipo in ("short", "freeform"):
-        instruccion = f"Question:\n{prompt_item}\n\nReply with ONLY the answer text, nothing else."
-    elif tipo == "structured":
-        # El formato exacto del schema esperado no esta detallado en la
-        # guia publica -- se pasa tal cual venga en el item y se le pide
-        # a Claude que devuelva JSON. Si MoltJobs usa un campo distinto a
-        # "schema" para esto, ajustar aca una vez que se vea un item real.
-        esquema = item.get("schema", "")
-        instruccion = (
-            f"Question:\n{prompt_item}\n\n"
-            f"Reply with ONLY a JSON object matching this schema:\n{esquema}"
-        )
+    elif tipo == "STRUCTURED_TASK":
+        esquema = item.get("outputSchema")
+        instruccion = f"Question:\n{prompt_item}\n\nReply with ONLY a valid JSON object"
+        if esquema:
+            instruccion += f" matching this schema:\n{esquema}"
+        instruccion += ". No markdown, no code fences, no explanation -- just the raw JSON."
     else:
-        instruccion = f"Question:\n{prompt_item}\n\nReply with ONLY the answer."
+        # SHORT_ANSWER y cualquier tipo no reconocido todavia: el prompt
+        # ya trae toda la instruccion necesaria (ver ejemplos reales).
+        instruccion = f"Question:\n{prompt_item}\n\nReply with ONLY the answer text, nothing else."
 
     inicio = time.monotonic()
     try:
@@ -151,12 +155,16 @@ def correr_eval(pack_id=PACK_POR_DEFECTO, modo=MODO_POR_DEFECTO):
     contador = 0
     while True:
         item = _pedir("GET", f"/evals/{quiz_id}/next")
-        if item is None:
+        # La guia publica dice que "data" viene null al agotar el pack,
+        # pero la API real devuelve un objeto con "done": true (y sin
+        # itemId) -- se chequean las tres formas por las dudas.
+        if not item or item.get("done") or not item.get("itemId"):
             break
 
         contador += 1
         respuesta_texto, duracion_ms = _responder_item(item)
-        print(f"[EVAL] Item {contador} ({item.get('itemId')}, {item.get('type')}): respondido en {duracion_ms}ms")
+        total_items = item.get("totalItems")
+        print(f"[EVAL] Item {contador}/{total_items} ({item.get('itemId')}, {item.get('type')}): respondido en {duracion_ms}ms")
 
         _pedir(
             "POST", f"/evals/{quiz_id}/items/{item['itemId']}/answer",
@@ -171,7 +179,7 @@ def correr_eval(pack_id=PACK_POR_DEFECTO, modo=MODO_POR_DEFECTO):
 
     reporte = _pedir("GET", f"/evals/{quiz_id}/report")
     resultado = "APROBADO" if reporte.get("passed") else "NO APROBADO"
-    print(f"[EVAL] Score: {reporte.get('score')} (minimo {reporte.get('passPct')}) -- {resultado}")
+    print(f"[EVAL] Score: {reporte.get('overallScore')} (minimo {reporte.get('passThreshold')}) -- {resultado}")
 
     certificacion = reporte.get("certification")
     if certificacion:
