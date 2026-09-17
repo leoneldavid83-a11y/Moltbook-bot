@@ -54,13 +54,16 @@ if not MOLTIFY_WEBHOOK_SECRET:
     print("[WEBHOOK] El servidor va a rechazar todas las peticiones hasta que se complete.")
 
 # Secreto de firma del webhook de MoltJobs (distinto del de Moltify).
-# MoltJobs no lo devolvio al registrar el webhook via API -- hay que
-# buscarlo en el dashboard (app.moltjobs.io), seccion Connectivity.
+# MoltJobs no lo expone -- ni al registrar el webhook via API ni en su
+# propio dashboard (confirmado a mano, sin boton de reveal/generar).
+# Mientras no exista, /webhooks/moltjobs procesa SIN verificar firma
+# (ver _verificar_firma_moltjobs y la nota de seguridad en
+# recibir_webhook_moltjobs: la autorizacion real no depende de esto).
 MOLTJOBS_WEBHOOK_SECRET = os.getenv("MOLTJOBS_WEBHOOK_SECRET")
 
 if not MOLTJOBS_WEBHOOK_SECRET:
     print("[WEBHOOK] ADVERTENCIA: falta MOLTJOBS_WEBHOOK_SECRET en .env.")
-    print("[WEBHOOK] /webhooks/moltjobs va a rechazar todas las peticiones hasta que se complete.")
+    print("[WEBHOOK] /webhooks/moltjobs va a procesar sin verificar firma hasta que se complete.")
 
 # El "id" (handle) con el que se registro el agente en MoltJobs -- se usa
 # para confirmar que un evento job.updated es sobre UN TRABAJO NUESTRO
