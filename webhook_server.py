@@ -32,9 +32,10 @@ import time
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
-from auditoria import elegir_skill_para_tarea, realizar_auditoria
+import estadisticas
+from auditoria import SKILLS_DISPONIBLES, elegir_skill_para_tarea, realizar_auditoria
 from reporte_pdf import generar_pdf_desde_markdown
 
 load_dotenv()
@@ -50,7 +51,18 @@ if not MOLTIFY_WEBHOOK_SECRET:
     print("[WEBHOOK] ADVERTENCIA: falta MOLTIFY_WEBHOOK_SECRET en .env.")
     print("[WEBHOOK] El servidor va a rechazar todas las peticiones hasta que se complete.")
 
+# Credenciales del dashboard privado de estadisticas (/dashboard). Si
+# DASHBOARD_PASSWORD no esta configurada, el endpoint rechaza todo --
+# mismo criterio de "seguro por defecto" que MOLTIFY_WEBHOOK_SECRET.
+DASHBOARD_USUARIO = os.getenv("DASHBOARD_USER", "davlerd")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
+
+if not DASHBOARD_PASSWORD:
+    print("[WEBHOOK] ADVERTENCIA: falta DASHBOARD_PASSWORD en .env.")
+    print("[WEBHOOK] /dashboard va a rechazar todas las peticiones hasta que se complete.")
+
 app = Flask(__name__)
+estadisticas.inicializar_base_datos()
 
 # Moltify exige max 50.000 caracteres en el campo "content" al entregar un
 # resultado. Con max_tokens=16000 en auditoria.py, un reporte muy largo
@@ -159,6 +171,7 @@ def _procesar_tarea(tarea):
     if tarea.get("test"):
         print(f"[WEBHOOK] Tarea de prueba ({task_id}): respondo sin correr una auditoria real.")
         _enviar_callback(callback_url, "deliver", "Test received -- davlerd's audit pipeline is online and ready.")
+        estadisticas.registrar_tarea(task_id, None, "prueba")
         return
 
     print(f"[WEBHOOK] Confirmando recepcion de la tarea real {task_id}...")
@@ -175,6 +188,7 @@ def _procesar_tarea(tarea):
     del tarea
 
     reporte = None
+    tipo_skill = None
     try:
         # Que skill usar no viene explicito en la tarea -- se infiere del
         # titulo/descripcion/requisitos con una clasificacion barata (esfuerzo
@@ -190,12 +204,14 @@ def _procesar_tarea(tarea):
 
         if not reporte:
             print(f"[WEBHOOK] La auditoria de la tarea {task_id} fallo; no se entrega el reporte final.")
+            estadisticas.registrar_tarea(task_id, tipo_skill, "fallida")
             return
 
         if len(reporte) > MAX_CARACTERES_ENTREGA:
             reporte = reporte[:MAX_CARACTERES_ENTREGA]
 
         _entregar_resultado_final(task_id, callback_url, reporte)
+        estadisticas.registrar_tarea(task_id, tipo_skill, "entregada")
     finally:
         # Se ejecuta siempre (exito, auditoria fallida, o excepcion): el
         # contenido del cliente no sobrevive mas alla de esta funcion.
@@ -291,6 +307,114 @@ def salud():
     chequeos automaticos cada <4h para seguir visible en el marketplace.
     """
     return jsonify({"status": "ok", "agent": "davlerd"}), 200
+
+
+def _autenticacion_dashboard_valida():
+    """
+    HTTP Basic Auth para /dashboard. Si DASHBOARD_PASSWORD no esta
+    configurada, siempre rechaza -- mismo criterio de "seguro por
+    defecto" que _verificar_firma() con MOLTIFY_WEBHOOK_SECRET.
+    """
+    auth = request.authorization
+    if not DASHBOARD_PASSWORD or not auth:
+        return False
+    usuario_ok = hmac.compare_digest(auth.username or "", DASHBOARD_USUARIO)
+    clave_ok = hmac.compare_digest(auth.password or "", DASHBOARD_PASSWORD)
+    return usuario_ok and clave_ok
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    """
+    Pagina privada (HTTP Basic Auth) con conteos de tareas procesadas y
+    que servicios se piden mas. Solo lee estadisticas.py -- metadatos
+    agregados (tipo de auditoria, estado, fecha), nunca el contenido que
+    mando el cliente (ver POLITICA DE RETENCION DE DATOS en
+    _procesar_tarea).
+    """
+    if not _autenticacion_dashboard_valida():
+        return Response(
+            "Authentication required.", 401,
+            {"WWW-Authenticate": 'Basic realm="davlerd dashboard"'},
+        )
+    resumen = estadisticas.obtener_resumen()
+    return Response(_renderizar_dashboard_html(resumen), mimetype="text/html")
+
+
+def _renderizar_dashboard_html(resumen):
+    import html as _html_mod
+
+    nombres_skill = {clave: datos["nombre_publico"] for clave, datos in SKILLS_DISPONIBLES.items()}
+
+    filas_estado = "".join(
+        f"<tr><td>{_html_mod.escape(str(fila['estado']))}</td><td>{fila['n']}</td></tr>"
+        for fila in resumen["por_estado"]
+    ) or "<tr><td colspan='2'>Sin datos todavia.</td></tr>"
+
+    filas_skill = "".join(
+        f"<tr><td>{_html_mod.escape(nombres_skill.get(fila['tipo_skill'], fila['tipo_skill']))}</td>"
+        f"<td>{fila['n']}</td></tr>"
+        for fila in resumen["por_skill"]
+    ) or "<tr><td colspan='2'>Sin auditorias entregadas todavia.</td></tr>"
+
+    filas_recientes = "".join(
+        f"<tr><td>{_html_mod.escape(str(fila['task_id']))}</td>"
+        f"<td>{_html_mod.escape(nombres_skill.get(fila['tipo_skill'], fila['tipo_skill'] or '-'))}</td>"
+        f"<td>{_html_mod.escape(str(fila['estado']))}</td>"
+        f"<td>{_html_mod.escape(str(fila['procesado_en']))}</td></tr>"
+        for fila in resumen["recientes"]
+    ) or "<tr><td colspan='4'>Sin tareas todavia.</td></tr>"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>davlerd -- Dashboard</title>
+<style>
+  body {{ background:#0B1B33; color:#E8ECF2; font-family: -apple-system, Segoe UI, Arial, sans-serif; margin:0; padding:32px 16px; }}
+  .contenedor {{ max-width: 900px; margin: 0 auto; }}
+  h1 {{ font-size: 22px; margin-bottom: 4px; }}
+  .subtitulo {{ color:#00C2A8; font-size: 13px; margin-bottom: 28px; }}
+  .tarjetas {{ display:flex; gap:16px; flex-wrap:wrap; margin-bottom: 32px; }}
+  .tarjeta {{ background:#122344; border:1px solid #1E2F52; border-radius:10px; padding:18px 22px; min-width:140px; }}
+  .tarjeta .numero {{ font-size: 28px; font-weight:700; color:#00C2A8; }}
+  .tarjeta .etiqueta {{ font-size: 12px; color:#9AA7BD; margin-top:4px; }}
+  table {{ width:100%; border-collapse: collapse; margin-bottom: 32px; font-size: 13px; }}
+  th {{ text-align:left; color:#9AA7BD; font-weight:600; padding:8px 10px; border-bottom:1px solid #1E2F52; }}
+  td {{ padding:8px 10px; border-bottom:1px solid #16233F; }}
+  h2 {{ font-size:15px; color:#E8ECF2; margin: 0 0 10px; }}
+</style>
+</head>
+<body>
+<div class="contenedor">
+  <h1>DAVLERD</h1>
+  <div class="subtitulo">Task dashboard -- internal use only</div>
+
+  <div class="tarjetas">
+    <div class="tarjeta"><div class="numero">{resumen['total']}</div><div class="etiqueta">Total tasks processed</div></div>
+  </div>
+
+  <h2>By status</h2>
+  <table>
+    <tr><th>Status</th><th>Count</th></tr>
+    {filas_estado}
+  </table>
+
+  <h2>Most requested services</h2>
+  <table>
+    <tr><th>Service</th><th>Delivered count</th></tr>
+    {filas_skill}
+  </table>
+
+  <h2>Recent tasks</h2>
+  <table>
+    <tr><th>Task ID</th><th>Service</th><th>Status</th><th>Processed at (UTC)</th></tr>
+    {filas_recientes}
+  </table>
+</div>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":
