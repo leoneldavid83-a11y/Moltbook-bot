@@ -116,7 +116,11 @@ def recibir_webhook():
         return jsonify({"received": True}), 200
 
     tarea = datos.get("data", {})
-    print(f"[WEBHOOK] Tarea nueva: {tarea.get('taskId')} -- {tarea.get('title')!r}")
+    # No se imprime el titulo/descripcion de la tarea (texto del cliente):
+    # este log va a webhook.log, que queda en disco indefinidamente. El
+    # taskId alcanza para rastrear el procesamiento sin retener contenido
+    # del cliente en un archivo persistente.
+    print(f"[WEBHOOK] Tarea nueva: {tarea.get('taskId')}")
 
     hilo = threading.Thread(target=_procesar_tarea, args=(tarea,), daemon=True)
     hilo.start()
@@ -138,6 +142,16 @@ def _procesar_tarea(tarea):
       despues corremos la auditoria de verdad (puede tardar varios minutos
       con esfuerzo alto) y recien ahi entregamos el resultado final
       ("deliver").
+
+    POLITICA DE RETENCION DE DATOS: el titulo/descripcion/requisitos que
+    manda el cliente (y el reporte generado a partir de eso) nunca se
+    escriben a disco ni a una base de datos -- viven solo como variables
+    locales de esta funcion mientras dura el procesamiento de ESTA tarea.
+    Al terminar (se haya entregado el reporte o haya fallado la auditoria),
+    se borran explicitamente de la memoria del proceso con `del` en vez de
+    dejar que el recolector de basura de Python las limpie eventualmente
+    por su cuenta -- no queda ningun registro del contenido del cliente
+    una vez generado y entregado el reporte.
     """
     task_id = tarea.get("taskId")
     callback_url = tarea.get("callbackUrl")
@@ -156,27 +170,36 @@ def _procesar_tarea(tarea):
     titulo = tarea.get("title", "")
     descripcion = tarea.get("description", "")
     requerimientos = tarea.get("requirements", "")
+    # Ya copiamos lo que necesitamos del dict original de la tarea -- no
+    # hace falta seguir sosteniendo una referencia a el.
+    del tarea
 
-    # Que skill usar no viene explicito en la tarea -- se infiere del
-    # titulo/descripcion/requisitos con una clasificacion barata (esfuerzo
-    # bajo) antes de correr la auditoria de verdad.
-    tipo_skill = elegir_skill_para_tarea(titulo, descripcion, requerimientos)
-    print(f"[WEBHOOK] Tarea {task_id} clasificada como: {tipo_skill}")
+    reporte = None
+    try:
+        # Que skill usar no viene explicito en la tarea -- se infiere del
+        # titulo/descripcion/requisitos con una clasificacion barata (esfuerzo
+        # bajo) antes de correr la auditoria de verdad.
+        tipo_skill = elegir_skill_para_tarea(titulo, descripcion, requerimientos)
+        print(f"[WEBHOOK] Tarea {task_id} clasificada como: {tipo_skill}")
 
-    reporte = realizar_auditoria(
-        tipo_skill,
-        contenido_objetivo=requerimientos or descripcion,
-        contexto_adicional=descripcion,
-    )
+        reporte = realizar_auditoria(
+            tipo_skill,
+            contenido_objetivo=requerimientos or descripcion,
+            contexto_adicional=descripcion,
+        )
 
-    if not reporte:
-        print(f"[WEBHOOK] La auditoria de la tarea {task_id} fallo; no se entrega el reporte final.")
-        return
+        if not reporte:
+            print(f"[WEBHOOK] La auditoria de la tarea {task_id} fallo; no se entrega el reporte final.")
+            return
 
-    if len(reporte) > MAX_CARACTERES_ENTREGA:
-        reporte = reporte[:MAX_CARACTERES_ENTREGA]
+        if len(reporte) > MAX_CARACTERES_ENTREGA:
+            reporte = reporte[:MAX_CARACTERES_ENTREGA]
 
-    _entregar_resultado_final(task_id, callback_url, reporte)
+        _entregar_resultado_final(task_id, callback_url, reporte)
+    finally:
+        # Se ejecuta siempre (exito, auditoria fallida, o excepcion): el
+        # contenido del cliente no sobrevive mas alla de esta funcion.
+        del titulo, descripcion, requerimientos, reporte
 
 
 def _entregar_resultado_final(task_id, callback_url, reporte):
@@ -190,15 +213,22 @@ def _entregar_resultado_final(task_id, callback_url, reporte):
     reporte_pdf.py lo extrae solo del primer encabezado del propio
     reporte, que suele ser mas descriptivo (ej. "Agent Security Audit:
     ...") que el titulo corto que puso el comprador al pedir la tarea.
+
+    Los bytes del PDF se borran explicitamente al terminar (ver POLITICA
+    DE RETENCION DE DATOS en _procesar_tarea) -- no quedan en memoria mas
+    tiempo del necesario para mandarlos.
     """
     pdf_bytes = generar_pdf_desde_markdown(reporte)
 
-    if pdf_bytes and MOLTIFY_API_KEY:
-        if _entregar_via_rest_con_pdf(task_id, reporte, pdf_bytes):
-            return
-        print("[WEBHOOK] La entrega con PDF fallo; caigo al callback de solo texto.")
+    try:
+        if pdf_bytes and MOLTIFY_API_KEY:
+            if _entregar_via_rest_con_pdf(task_id, reporte, pdf_bytes):
+                return
+            print("[WEBHOOK] La entrega con PDF fallo; caigo al callback de solo texto.")
 
-    _enviar_callback(callback_url, "deliver", reporte)
+        _enviar_callback(callback_url, "deliver", reporte)
+    finally:
+        del pdf_bytes
 
 
 def _entregar_via_rest_con_pdf(task_id, contenido_texto, pdf_bytes):
