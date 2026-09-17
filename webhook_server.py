@@ -333,8 +333,18 @@ def _verificar_firma_moltjobs(cuerpo_crudo, header_valor):
     confirmado contra una entrega real todavia, ver comentario en la
     ruta de abajo). HMAC-SHA256 sobre "{timestamp}.{cuerpo_crudo}",
     mas rechazo de firmas de mas de 5 minutos (proteccion anti-replay).
+
+    Si no hay MOLTJOBS_WEBHOOK_SECRET configurada, devuelve None (no
+    True/False) -- MoltJobs no expone ningun secreto para este webhook
+    todavia (ni en su dashboard ni en la respuesta de la API al
+    registrarlo, confirmado a mano), asi que no hay nada contra que
+    verificar. El llamador trata None como "sin firma, pero se procesa
+    igual" en vez de rechazar de plano -- ver nota de seguridad en
+    recibir_webhook_moltjobs().
     """
-    if not MOLTJOBS_WEBHOOK_SECRET or not header_valor:
+    if not MOLTJOBS_WEBHOOK_SECRET:
+        return None
+    if not header_valor:
         return False
     try:
         partes = dict(kv.split("=", 1) for kv in header_valor.split(","))
@@ -373,16 +383,30 @@ def recibir_webhook_moltjobs():
     si MOLTJOBS_WEBHOOK_SECRET esta mal o si el formato real de la firma
     resulta distinto al documentado (ya paso con otras partes de esta
     API -- ver moltjobs_cert.py y moltjobs_marketplace.py).
+
+    NOTA DE SEGURIDAD (sin firma configurable todavia, ver
+    _verificar_firma_moltjobs): la autorizacion real no depende de esta
+    firma -- _procesar_evento_moltjobs() vuelve a pedir el detalle del
+    trabajo a la API AUTENTICADA de MoltJobs (con nuestro propio API key)
+    y solo actua si esa fuente de verdad confirma que el trabajo es
+    nuestro (agentId) y esta realmente ASSIGNED. Un tercero que descubra
+    esta URL y mande eventos falsos como mucho nos hace pedir de mas
+    datos publicos/propios por API -- no puede hacer que ejecutemos o
+    entreguemos nada que no sea legitimamente nuestro.
     """
     cuerpo_crudo = request.get_data()
     firma_header = request.headers.get("MoltJobs-Signature")
+    firma_valida = _verificar_firma_moltjobs(cuerpo_crudo, firma_header)
 
-    if not _verificar_firma_moltjobs(cuerpo_crudo, firma_header):
-        print("[MOLTJOBS] Firma invalida o ausente -- peticion rechazada. Headers recibidos:")
+    if firma_valida is False:
+        print("[MOLTJOBS] Firma invalida -- peticion rechazada. Headers recibidos:")
         for nombre, valor in request.headers.items():
             if nombre.lower() not in ("authorization", "cookie"):
                 print(f"  {nombre}: {valor}")
         return jsonify({"error": "invalid signature"}), 401
+
+    if firma_valida is None:
+        print("[MOLTJOBS] ADVERTENCIA: sin MOLTJOBS_WEBHOOK_SECRET configurada -- se procesa sin verificar firma (ver nota de seguridad).")
 
     evento = request.get_json(silent=True) or {}
     print(f"[MOLTJOBS] Evento recibido: {evento.get('type')} ({evento.get('id')})")
@@ -397,33 +421,44 @@ def _procesar_evento_moltjobs(evento):
     """
     Vive en su propio hilo, igual que _procesar_tarea() para Moltify.
 
+    Que nombres de evento manda realmente MoltJobs es un blanco movil:
+    la guia publica documenta 8 tipos granulares (job.assigned,
+    job.paid, etc.), una vista del dashboard mostro solo "job.updated" +
+    "message.created", y otra vista distinta mostro "job.assigned" /
+    "job.rejected" / "job.approved" -- tres listas distintas en tres
+    lugares distintos. En vez de apostar a un nombre exacto, se reacciona
+    a CUALQUIER evento cuyo type empiece con "job." pidiendo el detalle
+    real del trabajo por API y decidiendo la accion segun su status
+    actual (fuente de verdad), no segun el nombre del evento.
+
     - "message.created": solo se loguea por ahora (sin auto-respuesta de
       chat en esta fase).
-    - "job.updated" con status ASSIGNED para un trabajo nuestro: dispara
-      la ejecucion completa (marcar iniciado -> auditoria real ->
-      entregar). Cualquier otro status de job.updated (SUBMITTED,
-      APPROVED, PAID, etc.) se ignora -- no requiere accion nuestra, ya
-      la disparamos nosotros mismos al entregar.
+    - Cualquier "job.*" para un trabajo con status ASSIGNED y agentId
+      nuestro: dispara la ejecucion completa (marcar iniciado ->
+      auditoria real -> entregar). Cualquier otro status (SUBMITTED,
+      APPROVED, PAID, REJECTED, etc.) no requiere accion nuestra -- ya la
+      disparamos nosotros mismos al entregar, o nunca nos asignaron el
+      trabajo.
 
     POLITICA DE RETENCION DE DATOS: igual que _procesar_tarea() para
     Moltify -- el titulo/descripcion del trabajo y el reporte generado
     se borran de memoria (`del`, en el finally) apenas se entrega o
     falla, nunca se escriben a disco.
     """
-    tipo = evento.get("type")
+    tipo = evento.get("type") or ""
     datos = evento.get("data") or {}
 
     if tipo == "message.created":
         print(f"[MOLTJOBS] Mensaje de chat recibido (sin auto-respuesta todavia): {datos.get('id')}")
         return
 
-    if tipo != "job.updated":
-        print(f"[MOLTJOBS] Evento sin manejar todavia: {tipo}")
+    if not tipo.startswith("job."):
+        print(f"[MOLTJOBS] Evento sin manejar todavia: {tipo!r}")
         return
 
     job_id = datos.get("jobId") or datos.get("id")
     if not job_id:
-        print("[MOLTJOBS] Evento job.updated sin jobId; se ignora.")
+        print(f"[MOLTJOBS] Evento {tipo!r} sin jobId; se ignora.")
         return
 
     # Se vuelve a pedir el detalle completo del trabajo en vez de confiar
