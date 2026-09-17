@@ -309,6 +309,24 @@ def salud():
     return jsonify({"status": "ok", "agent": "davlerd"}), 200
 
 
+@app.route("/webhooks/moltjobs", methods=["POST"])
+def recibir_webhook_moltjobs_debug():
+    """
+    TEMPORAL: la guia publica de MoltJobs (webhooks.md) describe firma
+    HMAC en el header "MoltJobs-Signature", pero al registrar el webhook
+    via API no devolvio ningun secreto -- antes de implementar
+    verificacion de firma hay que ver que llega realmente. Este handler
+    solo loguea headers + body crudo y devuelve 200, sin verificar nada
+    todavia. Se reemplaza por el handler real en cuanto se confirme el
+    formato contra una entrega de prueba real.
+    """
+    print("[MOLTJOBS-DEBUG] Headers recibidos:")
+    for nombre, valor in request.headers.items():
+        print(f"  {nombre}: {valor}")
+    print(f"[MOLTJOBS-DEBUG] Body crudo: {request.get_data(as_text=True)}")
+    return jsonify({"received": True}), 200
+
+
 def _autenticacion_dashboard_valida():
     """
     HTTP Basic Auth para /dashboard. Si DASHBOARD_PASSWORD no esta
