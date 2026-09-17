@@ -22,6 +22,7 @@ crezca en RAM. moltjobs_state.py (sqlite) es lo unico que persiste entre
 corridas, para no pujar dos veces por el mismo trabajo.
 """
 
+import json
 import os
 import sys
 
@@ -40,38 +41,80 @@ if not ANTHROPIC_API_KEY:
 cliente_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 MODELO_LLM = "claude-sonnet-5"
-NIVEL_ESFUERZO_PITCH = "low"
+NIVEL_ESFUERZO_OFERTA = "medium"
 
-# ETA por defecto para la propuesta: un audit real de OWASP tarda mas
-# que unos minutos, igual que se le aclara al cliente en Moltify.
-ETA_MINUTOS_POR_DEFECTO = 180
+# Nunca se puja por encima del presupuesto que puso quien publico el
+# trabajo (es lo habitual en este tipo de marketplace -- el presupuesto
+# es un techo, no un piso), ni por debajo de este minimo (un audit real
+# con metodologia OWASP no tiene sentido regalado).
+MONTO_MINIMO_USDC = 1
 
-SYSTEM_PROMPT_PITCH = """
-You are davlerd, an AI agent bidding for a security-audit job on the
-MoltJobs marketplace. Given the job's title and description, write a
-short bid pitch (2-3 sentences max, no markdown) explaining that you'll
-run a structured, OWASP Secure Agent Playbook-based audit and deliver a
-findings report ranked by severity. Be concrete about the job's actual
-content, not generic. Output ONLY the pitch text, nothing else.
+SYSTEM_PROMPT_OFERTA = """
+You are davlerd, an AI agent evaluating whether to bid on a security-audit
+job on the MoltJobs marketplace. Given the job's title, description, and
+the poster's suggested budget, judge the REAL complexity of the work
+(scope, likely size of the target, depth of analysis implied) and decide:
+
+1. Whether this is a good fit to bid on at all (shouldBid).
+2. A fair bid amount in USDC -- NEVER above the poster's budget, but
+   below it if the job looks simpler than the budget suggests, or if
+   bidding competitively makes sense with zero reputation built up yet.
+3. A realistic ETA in minutes for a real OWASP Secure Agent Playbook
+   audit (not a rushed one -- more items/broader scope should take
+   longer, never less than 60 minutes).
+4. A short bid pitch (2-3 sentences, no markdown) explaining you'll run
+   a structured, OWASP-based audit and deliver a severity-ranked
+   findings report. Be concrete about the job's actual content, not
+   generic.
+
+Reply with ONLY a JSON object, no markdown, no code fences:
+{"shouldBid": true|false, "amountUsdc": "<number as string>", "etaMinutes": <integer>, "pitch": "<string>", "reason": "<one short sentence>"}
 """.strip()
 
 
-def _armar_pitch(titulo, descripcion):
+def _evaluar_oferta(titulo, descripcion, presupuesto_usdc):
+    """
+    Le pide a Claude que evalue la complejidad real del trabajo contra el
+    presupuesto sugerido, y devuelva si conviene pujar y por cuanto.
+    Devuelve un dict (ver SYSTEM_PROMPT_OFERTA) o None si algo fallo.
+    """
+    mensaje_usuario = (
+        f"Title: {titulo}\n\nDescription: {descripcion}\n\n"
+        f"Poster's suggested budget: {presupuesto_usdc} USDC"
+    )
     try:
         respuesta = cliente_anthropic.messages.create(
             model=MODELO_LLM,
-            max_tokens=200,
-            system=SYSTEM_PROMPT_PITCH,
-            messages=[{"role": "user", "content": f"Title: {titulo}\n\nDescription: {descripcion}"}],
-            output_config={"effort": NIVEL_ESFUERZO_PITCH},
+            max_tokens=400,
+            system=SYSTEM_PROMPT_OFERTA,
+            messages=[{"role": "user", "content": mensaje_usuario}],
+            output_config={"effort": NIVEL_ESFUERZO_OFERTA},
         )
         if respuesta.stop_reason == "refusal":
+            print("[DISCOVER] Claude rechazo evaluar este trabajo.")
             return None
         bloque_texto = next((b.text for b in respuesta.content if b.type == "text"), None)
-        return bloque_texto.strip() if bloque_texto else None
+        if not bloque_texto:
+            return None
+        oferta = json.loads(bloque_texto.strip())
     except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError):
-        print("[DISCOVER] Error de la API de Anthropic al armar el pitch.")
+        print("[DISCOVER] Error de la API de Anthropic al evaluar el trabajo.")
         return None
+    except (json.JSONDecodeError, ValueError):
+        print("[DISCOVER] Claude devolvio una respuesta que no es JSON valido; se omite.")
+        return None
+
+    # El presupuesto del comprador es un techo duro, sin importar lo que
+    # haya propuesto Claude -- nunca se puja por encima de eso.
+    try:
+        monto = float(oferta.get("amountUsdc", 0))
+        techo = float(presupuesto_usdc)
+    except (TypeError, ValueError):
+        return None
+
+    monto = max(MONTO_MINIMO_USDC, min(monto, techo))
+    oferta["amountUsdc"] = f"{monto:.2f}"
+    return oferta
 
 
 def correr():
@@ -101,15 +144,23 @@ def correr():
 
         print(f"[DISCOVER] Trabajo nuevo: {job_id} -- {titulo!r} (presupuesto {presupuesto} USDC)")
 
-        pitch = _armar_pitch(titulo, descripcion)
-        if not pitch:
-            print(f"[DISCOVER] No se pudo armar un pitch para {job_id}; se omite esta corrida.")
+        oferta = _evaluar_oferta(titulo, descripcion, presupuesto)
+        if not oferta:
+            print(f"[DISCOVER] No se pudo evaluar {job_id}; se omite esta corrida (se reintenta despues).")
+            continue
+
+        if not oferta.get("shouldBid"):
+            print(f"[DISCOVER] Se decide NO pujar por {job_id}: {oferta.get('reason', 'sin motivo dado')}")
+            estado.marcar_estado(job_id, "descartado")
             continue
 
         try:
-            mercado.pujar(job_id, presupuesto, pitch, eta_minutos=ETA_MINUTOS_POR_DEFECTO)
+            mercado.pujar(
+                job_id, oferta["amountUsdc"], oferta.get("pitch", ""),
+                eta_minutos=oferta.get("etaMinutes"),
+            )
             estado.marcar_estado(job_id, "pujado")
-            print(f"[DISCOVER] Puja enviada para {job_id}.")
+            print(f"[DISCOVER] Puja enviada para {job_id}: {oferta['amountUsdc']} USDC, ETA {oferta.get('etaMinutes')} min.")
         except Exception:
             print(f"[DISCOVER] Error al pujar por {job_id}; no se registra como pujado (se reintenta despues).")
 
