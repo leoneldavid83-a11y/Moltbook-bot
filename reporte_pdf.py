@@ -194,6 +194,19 @@ def extract_subject_from_md(md_text: str):
 
 def inline_markup(text: str) -> str:
     text = text.strip()
+    # Escapar ANTES de aplicar nuestro propio markup, siempre. El texto de
+    # origen es el reporte que genera Claude a partir del contenido
+    # auditado -- que puede ser adversarial, dado que el proposito del bot
+    # es justamente analizar contenido potencialmente hostil (ej. un
+    # cliente que manda un target con un payload de prompt injection). Si
+    # ese texto contiene literalmente algo como "<img src='http://...'>"
+    # (plausible si un hallazgo cita esa cadena como evidencia de un XSS),
+    # sin escapar reportlab lo interpretaria como markup real de Paragraph
+    # (soporta <b>,<i>,<font>,<a>,<img>,<br/>, etc.) -- <img> en particular
+    # hace que nuestro propio servidor intente bajar esa URL al generar el
+    # PDF (SSRF), ademas de que cualquier tag no soportada rompe el render.
+    # Se escapa "&" primero para no doble-escapar los "&amp;" resultantes.
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\*)\*(.+?)\*(?!\*)", r"<i>\1</i>", text)
     text = re.sub(r"`(.+?)`", r"<font face='Courier'>\1</font>", text)
