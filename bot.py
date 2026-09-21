@@ -299,10 +299,17 @@ def escuchar_comunidad():
         publicaciones = datos.get("posts", [])
 
         # Construimos un resumen breve con, como mucho, las ultimas 10 publicaciones.
+        # OJO: se usa "or" en vez del default de .get() -- Moltbook a veces
+        # devuelve la clave presente pero con valor null (None), no ausente,
+        # y .get(clave, default) solo aplica el default cuando la clave
+        # falta. Esto crasheo el proceso entero una vez (TypeError al
+        # intentar recortar None con [:200]) porque no habia try/except que
+        # lo cubriera bien -- sin supervisor que reinicie el proceso, se
+        # quedo caido en silencio hasta que alguien lo noto.
         lineas = []
         for publicacion in publicaciones[:10]:
-            titulo = publicacion.get("title", "(sin titulo)")
-            contenido = publicacion.get("content", "")[:200]  # recortamos para no saturar el prompt
+            titulo = publicacion.get("title") or "(sin titulo)"
+            contenido = (publicacion.get("content") or "")[:200]  # recortamos para no saturar el prompt
             lineas.append(f"- {titulo}: {contenido}")
 
         contexto = "\n".join(lineas)
@@ -318,6 +325,14 @@ def escuchar_comunidad():
     except (ValueError, KeyError):
         # ValueError cubre errores al parsear JSON; KeyError, campos inesperados.
         print("[ESCUCHAR] Error al interpretar la respuesta de la API.")
+    except Exception:
+        # Red de contencion final: el docstring de esta funcion promete que
+        # NINGUNA excepcion se propaga (para no tumbar el loop principal de
+        # main(), que no tiene su propio try/except alrededor de esta
+        # llamada). Un TypeError no anticipado aca crasheo el proceso
+        # entero una vez -- mejor capturar cualquier cosa no prevista que
+        # confiar en enumerar todos los tipos de excepcion posibles.
+        print("[ESCUCHAR] Error inesperado al procesar la respuesta de la API.")
 
     return None
 
@@ -1263,22 +1278,37 @@ def main():
         except Exception:
             print("[CICLO] Error inesperado al revisar a quien seguir; se continua igual.")
 
-        # --- ESCUCHAR ---
-        contexto = escuchar_comunidad()
-        if contexto is None:
-            print(f"[CICLO] La fase de escucha fallo. Reintentando en {tiempo_espera}s.")
-            time.sleep(tiempo_espera)
-            continue  # saltamos directamente a la siguiente vuelta del bucle
+        # --- ESCUCHAR / PENSAR / ACTUAR ---
+        # Todo este bloque va envuelto en un try/except general, ademas de
+        # que cada funcion ya maneja sus propios errores esperados
+        # (timeouts, HTTP, JSON) internamente. Motivo: una excepcion NO
+        # anticipada en cualquiera de estas tres funciones (ej. un
+        # TypeError por un campo inesperadamente null en la respuesta de
+        # Moltbook -- paso de verdad una vez) tumbaba el proceso entero, y
+        # como no hay ningun supervisor que lo reinicie solo, se quedaba
+        # caido en silencio hasta que alguien lo notaba a mano. Con esto,
+        # el peor caso es perder UN ciclo, no el agente completo.
+        try:
+            # --- ESCUCHAR ---
+            contexto = escuchar_comunidad()
+            if contexto is None:
+                print(f"[CICLO] La fase de escucha fallo. Reintentando en {tiempo_espera}s.")
+                time.sleep(tiempo_espera)
+                continue  # saltamos directamente a la siguiente vuelta del bucle
 
-        # --- PENSAR ---
-        texto_generado = pensar_respuesta(contexto)
-        if not texto_generado:
-            print(f"[CICLO] La fase de pensamiento fallo. Reintentando en {tiempo_espera}s.")
+            # --- PENSAR ---
+            texto_generado = pensar_respuesta(contexto)
+            if not texto_generado:
+                print(f"[CICLO] La fase de pensamiento fallo. Reintentando en {tiempo_espera}s.")
+                time.sleep(tiempo_espera)
+                continue
+
+            # --- ACTUAR ---
+            actuar_publicar(texto_generado)
+        except Exception:
+            print(f"[CICLO] Error inesperado en escuchar/pensar/actuar; se continua en {tiempo_espera}s.")
             time.sleep(tiempo_espera)
             continue
-
-        # --- ACTUAR ---
-        actuar_publicar(texto_generado)
 
         # --- ESPERAR (RATE LIMIT: 2h para agente nuevo, 31 min tras 24h) ---
         print(f"[CICLO] Esperando {tiempo_espera} segundos antes del proximo ciclo...")
