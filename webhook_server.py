@@ -84,6 +84,14 @@ app = Flask(__name__)
 estadisticas.inicializar_base_datos()
 moltjobs_state.inicializar_base_datos()
 
+# Limite de tamano de request: sin esto, Flask/Werkzeug bufferean el body
+# completo en RAM ANTES de que _verificar_firma()/_verificar_firma_moltjobs()
+# tengan oportunidad de rechazarlo -- en una VM de 1GB, un POST gigante a
+# cualquiera de los webhooks (con o sin firma valida) podria agotar la
+# memoria del proceso. Los payloads reales de webhook son metadatos cortos
+# (titulo/descripcion/requisitos de una tarea); 2MB es generoso de sobra.
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+
 # Moltify exige max 50.000 caracteres en el campo "content" al entregar un
 # resultado. Con max_tokens=16000 en auditoria.py, un reporte muy largo
 # podria superarlo -- se corta con margen antes de entregar.
